@@ -95,7 +95,8 @@ does not change saved settings. Press **Q** in the video window to quit.
 
 `python vision.py --person` uses the **laptop webcam**, not the drone camera.
 Plain `python main.py` refuses live control. Use the dry-run command above while
-troubleshooting video; live control requires the explicit flight-test mode below.
+troubleshooting video; live control requires `--flight-test` or explicit yaw-only
+`--person` mode described below.
 
 ### If video still does not appear
 
@@ -160,7 +161,7 @@ instead of cloning again. Join the drone Wi-Fi, then launch video only:
 python -c 'import config; config.VIDEO_SOURCE = "drone"; config.CONTROL_PORT = None; import main; main.main()'
 ```
 
-## First computer-controlled takeoff/hover/landing test
+## First computer-controlled takeoff/manual/landing test
 
 This is a restricted flight-test mode, not autonomous target following. Confirm
 the video-only setup above works first. Run these offline checks before connecting:
@@ -198,19 +199,45 @@ This uses the saved drone address and control port; `CONTROL_PORT` must be a
 live port (currently 8800). If the console says `DRY RUN`, flight commands are
 disabled. Do not change this while the program is running.
 
-- Wait for at least one second of fresh video. Focus the video window.
-- `T` requests gyro calibration, waits about one second, then requests takeoff.
-  Verify props-off responses first. The program commands neutral sticks after
-  takeoff; it does not steer toward a target. `A` is disabled in this mode.
+- Wait for the live camera feed to appear. Focus the video window. A recent frame
+  is required, but there is no one-second continuous-video wait.
+- `T` requests takeoff directly, without automatic calibration or a preflight delay.
+  Verify props-off responses first. The program commands neutral sticks for
+  three seconds after takeoff, then permits the manual controls below. It does
+  not steer toward a target; autopilot is disabled in this mode.
+- `P` remains available for optional gyro calibration on a flat surface with motors off.
 - `SPACE` cancels a pending takeoff or requests landing if this program has
   requested takeoff. `Q` or closing the window also cancels/requests landing.
 - `K` requests immediate motor stop; an airborne drone will drop. It is not a
   normal landing control.
+- After the three-second takeoff settling period, use **short keyboard taps**
+  with the video window focused:
+
+  | Keys | Manual control |
+  |---|---|
+  | `W` / `S` | Pitch: forward / backward |
+  | `A` / `D` | Roll: left / right |
+  | `E` / `C` | Throttle: climb / descend |
+  | `J` / `L` | Yaw: turn left / right |
+  | `H` | Immediately request neutral sticks / hover |
+
+  Each key event requests one axis for at most 0.2 seconds, then automatically
+  returns to neutral. A new direction replaces the previous direction; simultaneous
+  multi-axis keyboard flight is not supported. Holding a key relies on OS key
+  repeat and may produce gaps, so start with taps. Pitch/roll are capped at 12%
+  of stick range and throttle/yaw at 15%, or the corresponding lower config cap.
+  These are relative stick inputs, not a commanded angle, altitude or speed.
+  Missing/stale video, landing, motor stop, and shutdown inhibit manual movement.
+  Verify axis directions on the actual drone with props off before airborne use.
 - One takeoff is allowed per session. After landing or a motor stop, physically
   confirm the drone is grounded before restarting. Do not start this program
   while the drone is already airborne under another controller.
-- Stale/missing video cancels pending takeoff and sends neutral/hover commands.
-  Loss of a target in tracking demos also immediately produces neutral commands.
+- A single missed frame does not issue hover or cancel manual input. Late frames
+  are displayed too; the window title indicates delayed or unavailable video.
+  Only a recently received frame refreshes the control watchdog. After 0.3 seconds
+  without fresh video, the sender cancels pending takeoff and uses neutral commands.
+  Manual inputs independently expire after 0.2 seconds without another key event.
+  An explicit lost-target detection in tracking demos immediately produces neutral commands.
   No forward movement or turning search is commanded while a target is missing.
 
 After the props-off checks, a supervised low hover in a clear area away from
@@ -278,8 +305,11 @@ only print messages; they do not control the drone.
 |---|---|
 | click | Select target color, or a person in person mode |
 | `P` | Calibrate gyro on a flat surface with motors off |
-| `T` | Calibrate, then take off (holds neutral commands for 3 seconds) |
+| `T` | Request takeoff directly (holds neutral commands for 3 seconds) |
 | `A` | Autopilot on/off (starts OFF) |
+| `W/S`, `A/D` | Flight-test only: manual pitch / roll (`A` is left roll here) |
+| `E/C`, `J/L` | Flight-test only: manual throttle / yaw |
+| `H` | Flight-test only: cancel manual input and request hover |
 | `SPACE` | Land and turn autopilot off |
 | `K` | Kill motors immediately (an airborne drone drops) |
 | `R` | Record the HUD to a video file |
@@ -300,5 +330,66 @@ formats unchanged. Only edit your assigned code unless the team agrees otherwise
 - Autopilot starts OFF. SPACE requests landing; K stops motors.
 - Lost target → neutral/hover commands immediately. Never keep flying blind.
 - Close target → stop forward motion. Image size does not guarantee 1–2 metres.
-- Never fly at people. Person mode is a webcam/dry-run demo.
+- Never fly at people. Live person mode turns only; it never commands approach or altitude changes.
 - Verify video first, with props off. Live flight behavior needs separate testing.
+
+## Person tracking on the drone feed
+
+`main.py --person` uses YOLO and BoT-SORT camera-motion compensation. It combines
+the selected track ID, clothing appearance, position/size continuity and confidence.
+Click a yellow person box, then press `A` to enable yaw tracking. Autopilot starts
+off. `T` requests takeoff, `H` cancels tracking and requests neutral sticks, and
+`SPACE` requests landing. There are no forward, sideways or altitude commands
+in this mode. Neutral sticks can still drift; physical flight testing is required.
+
+Start with the drone camera and **flight commands disabled** (Mac example):
+
+```bash
+.venv/bin/python main.py --person --dry-run
+```
+
+Add `--webcam` for the laptop camera. Remove `--dry-run` only for supervised
+hardware checks after the existing props-off procedure. On Windows use
+`.\.venv-win\Scripts\python.exe` in place of `.venv/bin/python`.
+
+- The display shows person IDs, confidence and measured detection time. Yellow
+  boxes are selectable; gray boxes are too uncertain to control flight.
+- Weak detections can preserve the same ID for up to 0.5 seconds, but command
+  neutral sticks throughout. Three strong detections are needed to resume.
+- A missing ID, overlapping people, implausible jump, appearance mismatch or
+  expired lock requires another click. No transfer to another tracking ID is allowed.
+- The 0.3-second detection deadline includes local video queue age and inference.
+  Slow results cannot steer. This is local receive age, not measured camera exposure age.
+- `R` saves both `run_...mp4` (HUD) and `run_..._raw.mp4` (clean frames for evaluation).
+  Files use fixed 15 fps playback, so their timing does not measure live latency.
+
+Model settings are command-line options, leaving shared config unchanged:
+
+```bash
+.venv/bin/python main.py --person --dry-run --model yolo11s.pt --device auto --imgsz 640
+.venv/bin/python main.py --person --dry-run --tracker bytetrack
+.venv/bin/python main.py --person --dry-run --video run_EXAMPLE_raw.mp4
+```
+
+The default is `yolo11n.pt`, size 640, BoT-SORT. `--device auto` selects available
+CUDA, Apple MPS, or CPU. The model warms up before opening a flight connection.
+Named YOLO11 n/s/m weights download on first use; do that while connected to the
+internet. A local model path is also accepted and must contain a `person` class.
+Larger models or input sizes need measurement before choosing them for live use.
+
+Run the offline timing probe without a camera or drone:
+
+```bash
+.venv/bin/python benchmark_vision.py --models yolo11n.pt yolo11s.pt --trackers botsort bytetrack
+.venv/bin/python benchmark_vision.py --source run_EXAMPLE_raw.mp4 --frames 100 --output /tmp/vision-results.json
+.venv/bin/python -m unittest test_person_tracking.py test_flight_safety.py
+.venv/bin/python test_pipeline.py
+```
+
+Without `--source`, the probe uses Ultralytics' bundled bus photo. It compares
+original and synthetically blurred/downsampled/compressed input, reports median
+and p95 processing time and detection counts. Counts are **not accuracy scores**;
+this does not establish performance on the drone. Use separate labeled drone
+recordings to measure missed people and wrong-person switches before changing defaults.
+
+Tracker reference: [Ultralytics tracking documentation](https://docs.ultralytics.com/modes/track/).

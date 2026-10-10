@@ -67,6 +67,15 @@ class VideoSource:
     def release(self):
         self.cap.release()
 
+    @property
+    def fresh(self):
+        return self.cap.fresh if self.kind == "drone" else True
+
+    @property
+    def frame_time(self):
+        """Local monotonic receive time, including time already spent in video queues."""
+        return self.cap.frame_time if self.kind == "drone" else time.monotonic()
+
 
 class DroneVideo:
     """Live video from the drone over UDP. Behaves like cv2.VideoCapture."""
@@ -76,6 +85,8 @@ class DroneVideo:
         from protocols.wifi_uav_video_protocol import WifiUavVideoProtocolAdapter
         self._adapter_cls = WifiUavVideoProtocolAdapter
         self.adapter = None
+        self.fresh = False
+        self.frame_time = 0.0
         self._connect()
 
     def _connect(self):
@@ -90,17 +101,18 @@ class DroneVideo:
         _shared_sock = self.adapter.get_receiver_socket()
 
     def read(self):
+        self.fresh = False
         if not self.adapter.is_running():
             print("[drone] no video — reconnecting (is the laptop on the drone's WiFi?)")
             self._connect()
         frame = self.adapter.get_frame(timeout=0.05)
         if frame is None:
             return False, None
-        # The adapter timestamps received frames; do not steer from queued old video.
+        # Display late frames too, but never treat them as fresh control feedback.
         age = time.time() - frame.timestamp
-        if age < -0.1 or age > 0.3:
-            return False, None
+        self.frame_time = time.monotonic() - max(0.0, age)
         img = cv2.imdecode(np.frombuffer(frame.data, np.uint8), cv2.IMREAD_COLOR)
+        self.fresh = img is not None and -0.1 <= age <= 0.3
         return img is not None, img
 
     def release(self):
@@ -140,9 +152,9 @@ class DroneLink:
     TAKEOFF_HOLD_S = 3.0   # hover while the drone climbs after takeoff
     STOP_PACKETS = 40      # repeat motor-stop for ~0.5 s so it can't get lost
     CALIBRATE_PACKETS = 20 # repeat gyro-calibrate for ~0.25 s
-    CALIBRATE_WAIT_S = 1.0 # let the gyro settle before taking off
-    VIDEO_READY_S = 1.0
     SHUTDOWN_S = 0.75
+    MANUAL_PULSE_S = 0.20  # key events must keep arriving; never latch a direction
+    MANUAL_LIMITS = {"forward": 0.12, "right": 0.12, "up": 0.15, "yaw": 0.15}
 
     def __init__(self, flight_test=False):
         self.dry_run = config.CONTROL_PORT is None
@@ -162,12 +174,13 @@ class DroneLink:
         self.sticks = _Sticks()
         self._cmd = HOVER
         self._cmd_time = 0.0
+        self._manual_cmd = dict(HOVER)
+        self._manual_until = 0.0
         self._hold_until = 0.0
         self._stop_left = 0
         self._calib_left = 0
-        self._takeoff_at = None   # time the pending takeoff fires after preflight
+        self._takeoff_at = None   # request consumed by the next sender tick
         self._video_time = None
-        self._video_since = None
         self._used_takeoff = False
         self._control_fault = False
         self._last_error = 0.0
@@ -182,9 +195,8 @@ class DroneLink:
             time.sleep(1 / self.RATE_HZ)
 
     def _video_ready(self, now):
-        return (self._video_time is not None and self._video_since is not None
-                and now - self._video_time <= self.STALE_S
-                and now - self._video_since >= self.VIDEO_READY_S)
+        return (self._video_time is not None
+                and 0 <= now - self._video_time <= self.STALE_S)
 
     def note_frame(self):
         """Called only after receiving a fresh drone frame."""
@@ -192,18 +204,17 @@ class DroneLink:
             return
         now = time.monotonic()
         with self._lock:
-            if self._video_time is None or now - self._video_time > self.STALE_S:
-                self._video_since = now
             self._video_time = now
 
     def video_lost(self):
         if self.dry_run:
             return
         with self._lock:
-            self._video_time = self._video_since = None
+            self._video_time = None
             self._takeoff_at = None
             self._calib_left = 0
             self._cmd = dict(HOVER)
+            self._manual_until = 0.0
 
     def _transmit(self, packet):
         """Report local socket acceptance; this is NOT a drone acknowledgement.
@@ -236,7 +247,9 @@ class DroneLink:
                     self._used_takeoff = True
                     self._hold_until = now + self.TAKEOFF_HOLD_S
                 cmd = self._cmd
-                if (self.flight_test or self._control_fault or not self.flying or now < self._hold_until
+                if self.flight_test:
+                    cmd = self._manual_cmd if now < self._manual_until else HOVER
+                if (self._closed or self._control_fault or not self.flying or now < self._hold_until
                         or now - self._cmd_time > self.STALE_S or not self._video_ready(now)):
                     cmd = HOVER
                 self.sticks.yaw = _stick(cmd["yaw"])
@@ -289,28 +302,90 @@ class DroneLink:
             self._cmd_time = time.monotonic()
 
     def hover(self):
+        if not self.dry_run:
+            with self._lock:
+                self._manual_until = 0.0
         self.send(HOVER)
 
-    def preflight(self, then_takeoff=False):
-        """P. Drone on a FLAT surface, motors off: calibrate the gyro."""
-        print("[drone] PREFLIGHT: calibrate gyro" + (", then TAKEOFF" if then_takeoff else ""))
+    def manual_nudge(self, axis, direction):
+        """One low-speed axis for 0.2 seconds; repeat key events to extend.
+
+        Only available in flight-test mode after takeoff settling. These are
+        relative stick inputs, not altitude/angle setpoints or position hold.
+        """
+        if axis not in self.MANUAL_LIMITS or direction not in (-1, 1):
+            raise ValueError("Manual input requires a known axis and direction -1 or 1")
+        if not self.flight_test:
+            return False
         if self.dry_run:
+            print(f"[drone] DRY RUN manual {axis}: {direction:+d}")
+            return False
+        now = time.monotonic()
+        with self._lock:
+            if (self._closed or self._control_fault or not self.flying
+                    or now < self._hold_until or not self._video_ready(now)):
+                print("[drone] Manual input blocked: need airborne state, settled takeoff and live video")
+                return False
+            configured = {"forward": config.MAX_FORWARD, "right": config.MAX_FORWARD,
+                          "up": config.MAX_UP, "yaw": config.MAX_YAW}
+            limit = max(0.0, min(self.MANUAL_LIMITS[axis], configured[axis]))
+            self._manual_cmd = dict(HOVER)
+            self._manual_cmd[axis] = direction * limit
+            self._manual_until = now + self.MANUAL_PULSE_S
+            self._cmd_time = now
+            return True
+
+    def manual_command(self):
+        """Current requested manual sticks for the HUD (not measured motion)."""
+        if self.dry_run:
+            return dict(HOVER)
+        now = time.monotonic()
+        with self._lock:
+            if (self.flight_test and self.flying and not self._closed and not self._control_fault
+                    and now >= self._hold_until and now < self._manual_until and self._video_ready(now)):
+                return dict(self._manual_cmd)
+        return dict(HOVER)
+
+    def _ground_action_block(self, now):
+        if self._closed:
+            return "program is closing"
+        if self._control_fault:
+            return "control socket failed; reconnect and restart while grounded"
+        if self.flying or self._takeoff_at is not None:
+            return "takeoff already requested"
+        if self._used_takeoff:
+            return "this session already requested takeoff/stop; confirm grounded, then restart"
+        if not self._video_ready(now):
+            return "drone video is missing or stale"
+        return None
+
+    def preflight(self):
+        """Optional P key: calibrate on a flat surface with motors off."""
+        if self.dry_run:
+            print("[drone] DRY RUN — would calibrate gyro")
             return
         with self._lock:
-            if (self._closed or self._control_fault or self._used_takeoff
-                    or self.flying or self._takeoff_at is not None):
-                print("[drone] Preflight blocked: active flight, prior takeoff/stop, or control fault; restart only when grounded")
-                return
-            if not self._video_ready(time.monotonic()):
-                print("[drone] Preflight blocked: need one second of fresh drone video")
+            reason = self._ground_action_block(time.monotonic())
+            if reason:
+                print(f"[drone] Calibration blocked: {reason}")
                 return
             self._calib_left = self.CALIBRATE_PACKETS
-            if then_takeoff:
-                self._takeoff_at = time.monotonic() + self.CALIBRATE_WAIT_S
+            print("[drone] Calibrating gyro")
 
     def takeoff(self):
-        """T. Calibrates the gyro first (~1 s), then takes off."""
-        self.preflight(then_takeoff=True)
+        """T. Request takeoff directly, without automatic calibration or delay."""
+        if self.dry_run:
+            print("[drone] DRY RUN — would request takeoff")
+            return
+        with self._lock:
+            now = time.monotonic()
+            reason = self._ground_action_block(now)
+            if reason:
+                print(f"[drone] Takeoff blocked: {reason}")
+                return
+            self._calib_left = 0
+            self._takeoff_at = now
+            print("[drone] Takeoff requested")
 
     def land(self):
         """SPACE. Takeoff and land are the same toggle bit on this drone, so it
@@ -323,6 +398,7 @@ class DroneLink:
             self._calib_left = 0
             self.sticks.takeoff_flag = False
             self._cmd = dict(HOVER)
+            self._manual_until = 0.0
             if not self.flying:
                 return
             self.sticks.land_flag = True
@@ -338,6 +414,7 @@ class DroneLink:
             self._calib_left = 0
             self.sticks.takeoff_flag = self.sticks.land_flag = False
             self._cmd = dict(HOVER)
+            self._manual_until = 0.0
             self._stop_left = self.STOP_PACKETS
             self._used_takeoff = True
             self.flying = False

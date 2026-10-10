@@ -7,6 +7,8 @@ Simple proportional control:
   target big enough      -> STOP (hover). Never ram the target.
   target lost            -> hover
 """
+import math
+
 import config
 
 HOVER = {"yaw": 0.0, "up": 0.0, "forward": 0.0, "right": 0.0}
@@ -21,12 +23,29 @@ def _deadband(err):
 
 
 class Controller:
-    def __init__(self):
+    def __init__(self, person_mode=False):
+        self.person_mode = person_mode
         self.lost_count = 0
         self.state = "SEARCHING"
 
     def update(self, target):
         """Return (command, state)."""
+        if self.person_mode:
+            valid = target.get("found") and all(
+                isinstance(target.get(k), (int, float)) and math.isfinite(target[k])
+                and 0 <= target[k] <= 1 for k in ("x", "y", "w", "h", "conf")
+            )
+            if not valid or target["conf"] < 0.6 or min(target["w"], target["h"]) <= 0:
+                self.state = "LOST"
+                return dict(HOVER), self.state
+            if target["w"] >= config.STOP_SIZE or target["h"] >= 0.65:
+                self.state = "REACHED"
+                return dict(HOVER), self.state
+            cmd = dict(HOVER)
+            cmd["yaw"] = _clamp(_deadband(target["x"] - 0.5) * 2 * config.YAW_GAIN,
+                                max(0.0, min(config.MAX_YAW, 0.15)))
+            self.state = "LOCKED"
+            return cmd, self.state
         if not target["found"]:
             self.lost_count += 1
             if self.state != "SEARCHING" and self.lost_count > config.LOST_FRAMES:
