@@ -1,0 +1,9 @@
+# Instructions for AI coding agents (Codex, Claude, Cursor)
+
+Read INTERFACES.md before doing anything. It defines the data formats every file uses.
+
+- Only edit the file the user says they own (drone.py, vision.py, hud.py, controller.py). Don't rewrite other files.
+- Don't change the Target / Command / State formats in INTERFACES.md.
+- Keep it simple — hackathon code. Python 3.10+, OpenCV.
+- Safety rules are non-negotiable: lost target = hover, target close = stop, autopilot starts OFF, SPACE = land. Never fly at people.
+- After changes, run `python test_pipeline.py` and make sure it still passes.
