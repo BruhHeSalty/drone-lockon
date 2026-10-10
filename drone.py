@@ -43,7 +43,8 @@ def _load_turbodrone():
 class VideoSource:
     """Gives frames from a file, the webcam, or the drone."""
 
-    def __init__(self, kind=config.VIDEO_SOURCE):
+    def __init__(self, kind=None):
+        kind = config.VIDEO_SOURCE if kind is None else kind
         self.kind = kind
         if kind == "file":
             self.cap = cv2.VideoCapture(config.VIDEO_FILE)
@@ -90,15 +91,21 @@ class DroneVideo:
 
     def read(self):
         if not self.adapter.is_running():
-            print("[drone] no video — reconnecting (is the Mac on the drone's WiFi?)")
+            print("[drone] no video — reconnecting (is the laptop on the drone's WiFi?)")
             self._connect()
-        frame = self.adapter.get_frame(timeout=0.5)
+        frame = self.adapter.get_frame(timeout=0.05)
         if frame is None:
+            return False, None
+        # The adapter timestamps received frames; do not steer from queued old video.
+        age = time.time() - frame.timestamp
+        if age < -0.1 or age > 0.3:
             return False, None
         img = cv2.imdecode(np.frombuffer(frame.data, np.uint8), cv2.IMREAD_COLOR)
         return img is not None, img
 
     def release(self):
+        global _shared_sock
+        _shared_sock = None
         self.adapter.stop()
 
 
@@ -134,10 +141,14 @@ class DroneLink:
     STOP_PACKETS = 40      # repeat motor-stop for ~0.5 s so it can't get lost
     CALIBRATE_PACKETS = 20 # repeat gyro-calibrate for ~0.25 s
     CALIBRATE_WAIT_S = 1.0 # let the gyro settle before taking off
+    VIDEO_READY_S = 1.0
+    SHUTDOWN_S = 0.75
 
-    def __init__(self):
+    def __init__(self, flight_test=False):
         self.dry_run = config.CONTROL_PORT is None
+        self.flight_test = flight_test
         self.flying = False
+        self._closed = False
         self._last_print = 0.0
         if self.dry_run:
             print("[drone] DRY RUN — commands are printed, not sent")
@@ -155,6 +166,11 @@ class DroneLink:
         self._stop_left = 0
         self._calib_left = 0
         self._takeoff_at = None   # time the pending takeoff fires after preflight
+        self._video_time = None
+        self._video_since = None
+        self._used_takeoff = False
+        self._control_fault = False
+        self._last_error = 0.0
         self._lock = threading.Lock()
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -162,15 +178,66 @@ class DroneLink:
 
     def _loop(self):
         while self._running:
-            now = time.time()
+            self._tick()
+            time.sleep(1 / self.RATE_HZ)
+
+    def _video_ready(self, now):
+        return (self._video_time is not None and self._video_since is not None
+                and now - self._video_time <= self.STALE_S
+                and now - self._video_since >= self.VIDEO_READY_S)
+
+    def note_frame(self):
+        """Called only after receiving a fresh drone frame."""
+        if self.dry_run:
+            return
+        now = time.monotonic()
+        with self._lock:
+            if self._video_time is None or now - self._video_time > self.STALE_S:
+                self._video_since = now
+            self._video_time = now
+
+    def video_lost(self):
+        if self.dry_run:
+            return
+        with self._lock:
+            self._video_time = self._video_since = None
+            self._takeoff_at = None
+            self._calib_left = 0
+            self._cmd = dict(HOVER)
+
+    def _transmit(self, packet):
+        """Report local socket acceptance; this is NOT a drone acknowledgement.
+
+        Upstream send_control_packet swallows socket failures, which would lose
+        our one-shot landing flag. Send on the same adapter socket/target ports
+        here so known local failures can preserve that intent.
+        """
+        accepted = False
+        for port in self.rc._target_ports:
+            try:
+                self.rc.sock.sendto(packet, (self.rc.drone_ip, port))
+                accepted = True
+            except OSError:
+                pass
+        return accepted
+
+    def _tick(self):
+        now = time.monotonic()
+        try:
             with self._lock:
+                if self._takeoff_at is not None and (self._closed or self._control_fault or not self._video_ready(now)):
+                    self._takeoff_at = None
+                    self._calib_left = 0
+                    print("[drone] Takeoff cancelled: fresh video required")
                 if self._takeoff_at is not None and now >= self._takeoff_at:
                     self._takeoff_at = None
                     self.sticks.takeoff_flag = True
                     self.flying = True
+                    self._used_takeoff = True
                     self._hold_until = now + self.TAKEOFF_HOLD_S
                 cmd = self._cmd
-                if not self.flying or now < self._hold_until or now - self._cmd_time > self.STALE_S:
+                if (self.flight_test or self._control_fault or not self.flying or now < self._hold_until
+                        or now - self._cmd_time > self.STALE_S or not self._video_ready(now)):
                     cmd = HOVER
                 self.sticks.yaw = _stick(cmd["yaw"])
                 self.sticks.pitch = _stick(cmd["forward"])
@@ -182,11 +249,33 @@ class DroneLink:
                 if self._calib_left > 0:
                     self.sticks.calibration_flag = True
                     self._calib_left -= 1
+                if _shared_sock is not None and self.rc.sock is not _shared_sock:
+                    self.rc.set_socket(_shared_sock)
+                landing = self.sticks.land_flag
+                taking_off = self.sticks.takeoff_flag
                 packet = self.rc.build_control_packet(self.sticks)
-            if _shared_sock is not None and self.rc.sock is not _shared_sock:
-                self.rc.set_socket(_shared_sock)
-            self.rc.send_control_packet(packet)
-            time.sleep(1 / self.RATE_HZ)
+                accepted = self._transmit(packet)
+                if not accepted:
+                    self._control_fault = True
+                    # Retry LAND only after a known local send failure. Never
+                    # repeat a successfully submitted takeoff/land toggle.
+                    self.sticks.land_flag = landing
+                    if taking_off:
+                        self.flying = False
+                    self._cmd = dict(HOVER)
+                    self._takeoff_at = None
+                    if now - self._last_error >= 1.0:
+                        print("[drone] Control send failed; physical response is unknown")
+                        self._last_error = now
+        except Exception as exc:
+            with self._lock:
+                self._takeoff_at = None
+                self._cmd = dict(HOVER)
+                self._control_fault = True
+                self.sticks.takeoff_flag = False
+            if now - self._last_error >= 1.0:
+                print(f"[drone] Control error: {exc}")
+                self._last_error = now
 
     def send(self, cmd):
         if self.dry_run:
@@ -196,8 +285,8 @@ class DroneLink:
                 self._last_print = now
             return
         with self._lock:
-            self._cmd = cmd
-            self._cmd_time = time.time()
+            self._cmd = dict(HOVER if self.flight_test else cmd)
+            self._cmd_time = time.monotonic()
 
     def hover(self):
         self.send(HOVER)
@@ -208,12 +297,16 @@ class DroneLink:
         if self.dry_run:
             return
         with self._lock:
-            if self.flying or self._takeoff_at is not None:
-                print("[drone] preflight skipped (already flying or taking off)")
+            if (self._closed or self._control_fault or self._used_takeoff
+                    or self.flying or self._takeoff_at is not None):
+                print("[drone] Preflight blocked: active flight, prior takeoff/stop, or control fault; restart only when grounded")
+                return
+            if not self._video_ready(time.monotonic()):
+                print("[drone] Preflight blocked: need one second of fresh drone video")
                 return
             self._calib_left = self.CALIBRATE_PACKETS
             if then_takeoff:
-                self._takeoff_at = time.time() + self.CALIBRATE_WAIT_S
+                self._takeoff_at = time.monotonic() + self.CALIBRATE_WAIT_S
 
     def takeoff(self):
         """T. Calibrates the gyro first (~1 s), then takes off."""
@@ -227,6 +320,9 @@ class DroneLink:
             return
         with self._lock:
             self._takeoff_at = None
+            self._calib_left = 0
+            self.sticks.takeoff_flag = False
+            self._cmd = dict(HOVER)
             if not self.flying:
                 return
             self.sticks.land_flag = True
@@ -239,15 +335,23 @@ class DroneLink:
             return
         with self._lock:
             self._takeoff_at = None
+            self._calib_left = 0
+            self.sticks.takeoff_flag = self.sticks.land_flag = False
+            self._cmd = dict(HOVER)
             self._stop_left = self.STOP_PACKETS
+            self._used_takeoff = True
             self.flying = False
 
     def close(self):
-        if self.dry_run:
+        if self.dry_run or self._closed:
             return
-        if self.flying:
-            self.land()
-            time.sleep(0.3)
+        with self._lock:
+            self._closed = True
+        self.land()  # also cancels a scheduled takeoff while still on the ground
+        # Keep the shared video socket alive until this flush is finished.
+        time.sleep(self.SHUTDOWN_S)
         self._running = False
         self._thread.join(timeout=1.0)
+        if self.sticks.land_flag:
+            print("[drone] WARNING: landing packet could not be submitted; physical landing is unconfirmed")
         self.rc.stop()

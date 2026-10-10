@@ -94,8 +94,8 @@ video-protocol requests, but does not send flight-control commands. This launch
 does not change saved settings. Press **Q** in the video window to quit.
 
 `python vision.py --person` uses the **laptop webcam**, not the drone camera.
-Plain `python main.py` uses the saved config, which currently enables live
-control; use the dry-run command above while troubleshooting video.
+Plain `python main.py` refuses live control. Use the dry-run command above while
+troubleshooting video; live control requires the explicit flight-test mode below.
 
 ### If video still does not appear
 
@@ -159,6 +159,72 @@ instead of cloning again. Join the drone Wi-Fi, then launch video only:
 ```bash
 python -c 'import config; config.VIDEO_SOURCE = "drone"; config.CONTROL_PORT = None; import main; main.main()'
 ```
+
+## First computer-controlled takeoff/hover/landing test
+
+This is a restricted flight-test mode, not autonomous target following. Confirm
+the video-only setup above works first. Run these offline checks before connecting:
+
+Windows PowerShell:
+
+```powershell
+.\.venv-win\Scripts\python.exe test_pipeline.py
+.\.venv-win\Scripts\python.exe test_flight_safety.py
+```
+
+Mac (with `.venv` active):
+
+```bash
+python test_pipeline.py
+python test_flight_safety.py
+```
+
+Then connect to the drone Wi-Fi. With the drone on a flat surface and props
+removed, launch:
+
+Windows PowerShell:
+
+```powershell
+.\.venv-win\Scripts\python.exe main.py --flight-test
+```
+
+Mac:
+
+```bash
+python main.py --flight-test
+```
+
+This uses the saved drone address and control port; `CONTROL_PORT` must be a
+live port (currently 8800). If the console says `DRY RUN`, flight commands are
+disabled. Do not change this while the program is running.
+
+- Wait for at least one second of fresh video. Focus the video window.
+- `T` requests gyro calibration, waits about one second, then requests takeoff.
+  Verify props-off responses first. The program commands neutral sticks after
+  takeoff; it does not steer toward a target. `A` is disabled in this mode.
+- `SPACE` cancels a pending takeoff or requests landing if this program has
+  requested takeoff. `Q` or closing the window also cancels/requests landing.
+- `K` requests immediate motor stop; an airborne drone will drop. It is not a
+  normal landing control.
+- One takeoff is allowed per session. After landing or a motor stop, physically
+  confirm the drone is grounded before restarting. Do not start this program
+  while the drone is already airborne under another controller.
+- Stale/missing video cancels pending takeoff and sends neutral/hover commands.
+  Loss of a target in tracking demos also immediately produces neutral commands.
+  No forward movement or turning search is commanded while a target is missing.
+
+After the props-off checks, a supervised low hover in a clear area away from
+people is a separate hardware test. Neutral sticks are not GPS position hold:
+the drone can drift. Keep the normal controller available, but do not assume
+it can override Wi-Fi commands until that handoff has been verified props-off.
+
+The protocol exposes a takeoff/land **toggle**, not a confirmed landing state.
+The program sends a landing toggle before closing the shared video socket and
+preserves it after a known local socket-send failure. It does not repeat a toggle
+after local submission because that could trigger the opposite action. UDP
+submission does not prove receipt or landing; a total Wi-Fi outage can prevent
+all commands from reaching the drone. Verify physical response and stop testing
+if it differs from the requested action. Offline tests do not certify flight safety.
 
 ## Webcam tests without a drone
 
