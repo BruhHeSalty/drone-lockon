@@ -2,8 +2,10 @@
 
 Controls (in the video window):
   click   pick the target color
+  T       take off (then hovers)
   A       autopilot on/off (starts OFF)
   SPACE   emergency land (also turns autopilot off)
+  K       KILL motors — drone drops (also turns autopilot off)
   R       start/stop recording the HUD to a video file
   Q       quit
 """
@@ -43,8 +45,15 @@ def main():
             frame = video.read()
             if frame is None:
                 link.hover()
-                if cv2.waitKey(30) & 0xFF == ord("q"):
+                key = cv2.waitKey(30) & 0xFF
+                if key == ord("q"):
                     break
+                elif key == ord(" "):
+                    autopilot = False
+                    link.land()
+                elif key == ord("k"):
+                    autopilot = False
+                    link.kill()
                 continue
             last_frame = frame
 
@@ -72,9 +81,14 @@ def main():
                 print(f"[main] autopilot {'ON' if autopilot else 'OFF'}")
                 if not autopilot:
                     link.hover()
+            elif key == ord("t"):
+                link.takeoff()
             elif key == ord(" "):
                 autopilot = False
                 link.land()
+            elif key == ord("k"):
+                autopilot = False
+                link.kill()
             elif key == ord("r"):
                 if recorder is None:
                     h, w = view.shape[:2]

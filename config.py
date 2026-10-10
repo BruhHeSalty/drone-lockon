@@ -4,7 +4,7 @@
 # "file"   -> play a recorded video (good for building without the drone)
 # "webcam" -> laptop webcam (good for quick tests)
 # "drone"  -> live drone feed (drone.py must implement it)
-VIDEO_SOURCE = "webcam"
+VIDEO_SOURCE = "drone"
 VIDEO_FILE = "test_video.mp4"
 WEBCAM_INDEX = 0
 
@@ -28,7 +28,9 @@ MAX_FORWARD = 0.25
 # Frames the target can disappear before we call it LOST and hover
 LOST_FRAMES = 5
 
-# ---- Drone network (Person 1 fills these in after the hack) ----
-DRONE_IP = "192.168.169.1"   # guess — check what IP your laptop gets on the drone WiFi
-VIDEO_PORT = 8800            # WiFi UAV video, per others' reverse engineering
-CONTROL_PORT = None          # unknown until the control hack is done
+# ---- Drone network ----
+DRONE_IP = "192.168.169.1"
+VIDEO_PORT = 8800
+CONTROL_PORT = 8800          # None = dry run: commands are printed, nothing is sent
+WIFI_UAV_VARIANT = "uav"     # the F19 only streams video in Turbodrone's "uav" mode
+TURBODRONE_PATH = "~/turbodrone/backend"
