@@ -5,7 +5,7 @@ alwaysApply: true
 
 # Instructions for AI coding agents (Codex, Claude, Cursor)
 
-Read INTERFACES.md before doing anything. It defines the data formats every file uses.
+Read PLAN.md (what we are building) and INTERFACES.md (data formats) before doing anything. It defines the data formats every file uses.
 
 - Only edit the file the user says they own (drone.py, vision.py, hud.py, controller.py). Don't rewrite other files.
 - Don't change the Target / Command / State formats in INTERFACES.md.
