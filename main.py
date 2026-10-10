@@ -2,7 +2,8 @@
 
 Controls (in the video window):
   click   pick the target color
-  T       take off (then hovers)
+  P       preflight only: calibrate gyro (drone flat, motors off)
+  T       calibrate gyro, then take off (then hovers)
   A       autopilot on/off (starts OFF)
   SPACE   emergency land (also turns autopilot off)
   K       KILL motors — drone drops (also turns autopilot off)
@@ -17,6 +18,7 @@ import config
 from controller import Controller
 from drone import DroneLink, VideoSource
 import hud
+import voice
 from vision import ColorTracker
 
 WINDOW = "drone-lockon"
@@ -60,6 +62,8 @@ def main():
             target = tracker.find(frame)
             command, state = controller.update(target)
 
+            voice.announce(state, frame, target)
+
             if autopilot:
                 link.send(command)
 
@@ -81,6 +85,8 @@ def main():
                 print(f"[main] autopilot {'ON' if autopilot else 'OFF'}")
                 if not autopilot:
                     link.hover()
+            elif key == ord("p"):
+                link.preflight()
             elif key == ord("t"):
                 link.takeoff()
             elif key == ord(" "):

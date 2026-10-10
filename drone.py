@@ -132,6 +132,8 @@ class DroneLink:
     STALE_S = 0.3          # no send() for this long -> hover
     TAKEOFF_HOLD_S = 3.0   # hover while the drone climbs after takeoff
     STOP_PACKETS = 40      # repeat motor-stop for ~0.5 s so it can't get lost
+    CALIBRATE_PACKETS = 20 # repeat gyro-calibrate for ~0.25 s
+    CALIBRATE_WAIT_S = 1.0 # let the gyro settle before taking off
 
     def __init__(self):
         self.dry_run = config.CONTROL_PORT is None
@@ -151,6 +153,8 @@ class DroneLink:
         self._cmd_time = 0.0
         self._hold_until = 0.0
         self._stop_left = 0
+        self._calib_left = 0
+        self._takeoff_at = None   # time the pending takeoff fires after preflight
         self._lock = threading.Lock()
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -160,6 +164,11 @@ class DroneLink:
         while self._running:
             now = time.time()
             with self._lock:
+                if self._takeoff_at is not None and now >= self._takeoff_at:
+                    self._takeoff_at = None
+                    self.sticks.takeoff_flag = True
+                    self.flying = True
+                    self._hold_until = now + self.TAKEOFF_HOLD_S
                 cmd = self._cmd
                 if not self.flying or now < self._hold_until or now - self._cmd_time > self.STALE_S:
                     cmd = HOVER
@@ -170,6 +179,9 @@ class DroneLink:
                 if self._stop_left > 0:
                     self.sticks.stop_flag = True
                     self._stop_left -= 1
+                if self._calib_left > 0:
+                    self.sticks.calibration_flag = True
+                    self._calib_left -= 1
                 packet = self.rc.build_control_packet(self.sticks)
             if _shared_sock is not None and self.rc.sock is not _shared_sock:
                 self.rc.set_socket(_shared_sock)
@@ -190,22 +202,33 @@ class DroneLink:
     def hover(self):
         self.send(HOVER)
 
-    def takeoff(self):
-        print("[drone] TAKEOFF")
-        if self.dry_run or self.flying:
+    def preflight(self, then_takeoff=False):
+        """P. Drone on a FLAT surface, motors off: calibrate the gyro."""
+        print("[drone] PREFLIGHT: calibrate gyro" + (", then TAKEOFF" if then_takeoff else ""))
+        if self.dry_run:
             return
         with self._lock:
-            self.sticks.takeoff_flag = True
-            self.flying = True
-            self._hold_until = time.time() + self.TAKEOFF_HOLD_S
+            if self.flying or self._takeoff_at is not None:
+                print("[drone] preflight skipped (already flying or taking off)")
+                return
+            self._calib_left = self.CALIBRATE_PACKETS
+            if then_takeoff:
+                self._takeoff_at = time.time() + self.CALIBRATE_WAIT_S
+
+    def takeoff(self):
+        """T. Calibrates the gyro first (~1 s), then takes off."""
+        self.preflight(then_takeoff=True)
 
     def land(self):
         """SPACE. Takeoff and land are the same toggle bit on this drone, so it
         is only sent while flying — otherwise it would take off instead."""
         print("[drone] LAND")
-        if self.dry_run or not self.flying:
+        if self.dry_run:
             return
         with self._lock:
+            self._takeoff_at = None
+            if not self.flying:
+                return
             self.sticks.land_flag = True
             self.flying = False
 
@@ -215,6 +238,7 @@ class DroneLink:
         if self.dry_run:
             return
         with self._lock:
+            self._takeoff_at = None
             self._stop_left = self.STOP_PACKETS
             self.flying = False
 
