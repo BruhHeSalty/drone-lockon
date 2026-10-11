@@ -44,13 +44,21 @@ def _init():
 def _speak(text):
     """Generate and play TTS audio (blocking — call from a thread)."""
     try:
-        from elevenlabs import play
+        import io
+        import sounddevice as sd
+        import soundfile as sf
+
         audio = _eleven.text_to_speech.convert(
             text=text,
             voice_id=_voice_id,
             model_id="eleven_turbo_v2",
+            output_format="pcm_24000",
         )
-        play(audio)
+        # audio is a generator of bytes — collect it
+        raw = b"".join(audio)
+        import numpy as np
+        samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        sd.play(samples, samplerate=24000, blocking=True)
     except Exception as e:
         print(f"[voice] TTS error: {e}")
 
@@ -123,7 +131,7 @@ def announce(state, frame=None, target=None):
         return
 
     text = None
-    if state == "LOCKED" and prev in ("SEARCHING", "LOST", None):
+    if state in ("LOCKED", "APPROACHING") and prev in ("SEARCHING", "LOST", None):
         color = ""
         if frame is not None and target is not None and target.get("found"):
             color = _color_name(frame, target)
