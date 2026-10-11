@@ -9,6 +9,7 @@ Setup:
   export ELEVENLABS_API_KEY="your-key-here"
 """
 import os
+import random
 import threading
 import time
 
@@ -76,42 +77,69 @@ _last_speak_time = 0.0
 _MIN_INTERVAL = 3.0  # don't spam callouts faster than this
 
 
-def _color_name(frame, target):
-    """Get a rough color name from the target's center region."""
-    import cv2
-    import numpy as np
+def _describe_target(frame, target):
+    """Short spoken description: position and distance only."""
+    tx = target["x"]
+    tw = target["w"]
 
-    h, w = frame.shape[:2]
-    cx, cy = int(target["x"] * w), int(target["y"] * h)
-    r = max(5, int(min(target["w"] * w, target["h"] * h) * 0.15))
-    x0, x1 = max(cx - r, 0), min(cx + r, w)
-    y0, y1 = max(cy - r, 0), min(cy + r, h)
-    patch = frame[y0:y1, x0:x1]
-    if patch.size == 0:
-        return ""
-    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
-    med = np.median(hsv.reshape(-1, 3), axis=0)
-    hue, sat, val = med[0], med[1], med[2]
+    if tx < 0.33:
+        pos = "left side"
+    elif tx > 0.66:
+        pos = "right side"
+    else:
+        pos = "dead ahead"
 
-    if val < 40:
-        return "black"
-    if sat < 30:
-        return "white" if val > 180 else "gray"
-    if hue < 10 or hue > 168:
-        return "red"
-    if hue < 25:
-        return "orange"
-    if hue < 35:
-        return "yellow"
-    if hue < 80:
-        return "green"
-    if hue < 105:
-        return "cyan"
-    if hue < 135:
-        return "blue"
-    if hue < 160:
-        return "purple"
-    return "red"
+    if tw > 0.4:
+        dist = "close range"
+    elif tw > 0.15:
+        dist = "mid range"
+    else:
+        dist = "long range"
+
+    return f"{pos}, {dist}"
+
+
+# --- Voice line pools ---
+
+_ACQUIRED_LINES = [
+    "Target acquired. {desc}.",
+    "Lock on confirmed. I see {desc}.",
+    "Target in sight. {desc}.",
+    "Contact. {desc}.",
+    "Got a visual. {desc}.",
+    "Tracking. {desc}.",
+]
+
+_APPROACHING_LINES = [
+    "Closing in on target.",
+    "Moving to intercept.",
+    "Approaching target. Hold steady.",
+    "En route to target.",
+    "Advancing on target position.",
+]
+
+_REACHED_LINES = [
+    "Target reached. Holding position.",
+    "We're on top of it. Hovering.",
+    "Arrived at target. Maintaining distance.",
+    "Target in range. Holding steady.",
+    "Right on target. Standing by.",
+]
+
+_LOST_LINES = [
+    "Target lost. Scanning.",
+    "I've lost visual. Searching the area.",
+    "Target dropped off. Looking around.",
+    "Contact lost. Standing by.",
+    "No visual. Sweeping the area.",
+]
+
+_REACQUIRED_LINES = [
+    "Target reacquired. {desc}.",
+    "I see it again. {desc}.",
+    "Back on track. {desc}.",
+    "Visual restored. {desc}.",
+]
 
 
 def announce(state, frame=None, target=None):
@@ -130,19 +158,23 @@ def announce(state, frame=None, target=None):
     if now - _last_speak_time < _MIN_INTERVAL:
         return
 
+    desc = ""
+    if frame is not None and target is not None and target.get("found"):
+        desc = _describe_target(frame, target)
+
     text = None
-    if state in ("LOCKED", "APPROACHING") and prev in ("SEARCHING", "LOST", None):
-        color = ""
-        if frame is not None and target is not None and target.get("found"):
-            color = _color_name(frame, target)
-        if color:
-            text = f"Target acquired. {color.capitalize()} object."
-        else:
-            text = "Target acquired."
+    if state in ("LOCKED", "APPROACHING") and prev in ("SEARCHING", None):
+        line = random.choice(_ACQUIRED_LINES)
+        text = line.format(desc=desc) if desc else line.replace(". {desc}", "").replace("{desc}", "target")
+    elif state in ("LOCKED", "APPROACHING") and prev == "LOST":
+        line = random.choice(_REACQUIRED_LINES)
+        text = line.format(desc=desc) if desc else line.replace(". {desc}", "").replace("{desc}", "target")
+    elif state == "APPROACHING" and prev in ("LOCKED", "REACHED"):
+        text = random.choice(_APPROACHING_LINES)
     elif state == "REACHED":
-        text = "Target reached. Holding position."
+        text = random.choice(_REACHED_LINES)
     elif state == "LOST" and prev in ("LOCKED", "APPROACHING", "REACHED"):
-        text = "Target lost. Scanning."
+        text = random.choice(_LOST_LINES)
 
     if text:
         _last_speak_time = now

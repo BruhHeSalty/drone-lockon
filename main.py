@@ -73,7 +73,7 @@ def main(flight_test=False, person=False, person_options=None):
             print("[main] Manual taps: W/S forward/back, A/D left/right, E/C climb/descend, J/L turn, H hover")
         if person:
             print("[main] PERSON: click to select, T takeoff, A yaw tracking, H hover, SPACE land")
-            print("[main] Turn only. Weak detections hover; missing or ambiguous people require another click.")
+            print("[main] Turn only. Selection is remembered out of view; uncertain matches hover until reacquired.")
 
         while True:
             frame = video.read()
