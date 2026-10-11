@@ -192,6 +192,7 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
             print('[main] T takeoff; L/SPACE land; K stop motors; H neutral; Esc land/quit. Tracking cannot steer.')
             print('[main] Outcome labels: 1 steady, 2 unstable, 3 crash (operator reports only; no automatic learning)')
             print('[main] After T, release the keys and wait for the 3-second TAKEOFF HOLD countdown to reach READY.')
+            print('[main] Person confirmation is visual only; manual movement does not require a target lock.')
         if flight_test:
             print("[main] FLIGHT TEST: T = takeoff/hover, SPACE = land, K = motor stop, Q = land/quit")
             print("[main] Tracking/autopilot disabled. One takeoff per session; restart only after confirming landing.")
@@ -209,11 +210,15 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
         while True:
             frame = video.read()
             fresh = frame is not None and video.fresh
+            # A 50 ms read timeout can occur between healthy camera frames.
+            # Held manual input uses the sender's existing 300 ms freshness
+            # deadline; detector-driven steering still requires a fresh frame.
+            manual_video_ready = fresh or (manual and live and frame is None and link.video_ready())
             if follow and not fresh:
                 controller.update(NOT_FOUND)  # A video gap resets forward confirmation immediately.
             if frame is None:
                 last_frame = None
-                if person:
+                if person and not (manual and manual_video_ready):
                     link.hover()
                 # Keep rendering the HUD on the last camera image. Returning
                 # the bare image here made every video gap erase the overlay.
@@ -221,6 +226,8 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
                 display_frame = (last_camera if last_camera is not None
                                  else np.zeros((480, 640, 3), dtype=np.uint8))
                 target, command = dict(NOT_FOUND), dict(HOVER)
+                if manual and manual_video_ready:
+                    command = link.manual_command()
                 state = "LOST" if person else "SEARCHING"
                 if not manual:
                     cv2.setWindowTitle(WINDOW, WINDOW + " (video unavailable)")
@@ -295,7 +302,9 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
                 cv2.putText(view, mode_hint, (10, 85),
                             cv2.FONT_HERSHEY_SIMPLEX, hint_scale, (0, 255, 255), 2)
             if not fresh:
-                cv2.putText(view, "VIDEO UNAVAILABLE" if frame is None else "VIDEO DELAYED", (10, 70),
+                video_hint = ('WAITING FOR NEXT FRAME' if manual and manual_video_ready else
+                              'VIDEO UNAVAILABLE' if frame is None else 'VIDEO DELAYED')
+                cv2.putText(view, video_hint, (10, 70),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
             if flight_test:
                 cv2.putText(view, "FLIGHT TEST: T hover / SPACE land / K stop", (10, 85),
@@ -336,10 +345,10 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
                 if keyboard_status != last_keyboard_status:
                     link.record_event('keyboard_state', **keyboard_status)
                     last_keyboard_status = keyboard_status
-                axes = ui.axes() if fresh and key == -1 else dict(HOVER)
+                axes = ui.axes() if manual_video_ready and key == -1 else dict(HOVER)
                 link.manual_input(axes)
                 reason = keyboard_status['blocked_reason'] or link.manual_status()
-                if not fresh:
+                if not manual_video_ready:
                     reason = 'VIDEO UNAVAILABLE: movement disabled'
                 manual_hint = 'Keys: ' + (' '.join(keyboard_status['keys']) or 'none') + ' | ' + reason
             else:

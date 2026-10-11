@@ -34,7 +34,6 @@ HOVER = {"yaw": 0.0, "up": 0.0, "forward": 0.0, "right": 0.0}
 _shared_sock = None
 _shared_control_link = None
 
-
 def _load_turbodrone():
     path = os.path.expanduser(config.TURBODRONE_PATH)
     if not os.path.isdir(path):
@@ -315,7 +314,7 @@ class DroneLink:
     SHUTDOWN_S = 0.75
     MANUAL_PULSE_S = 0.20  # key events must keep arriving; never latch a direction
     MANUAL_LIMITS = {"forward": 0.12, "right": 0.12, "up": 0.15, "yaw": 0.15}
-    KEYBOARD_LIMITS = {"forward": 0.03, "right": 0.03, "up": 0.08, "yaw": 0.08}
+    KEYBOARD_LIMITS = {"forward": 0.20, "right": 0.20, "up": 0.20, "yaw": 0.20}
 
     def __init__(self, flight_test=False):
         global _shared_control_link
@@ -367,7 +366,9 @@ class DroneLink:
         self.record_event("session_start", variant=config.WIFI_UAV_VARIANT,
                           flight_test=flight_test, airborne_verified=False,
                           rate_hz=self.RATE_HZ, speed_index=self.sticks.speed_index,
+                          command_sequence='upstream',
                           note="Times measure command attempts, not time in the air")
+        print('[drone] Control transport: original Turbodrone packet numbering')
         self._lock = threading.Lock()
         _shared_control_link = self
         self._running = True
@@ -650,6 +651,13 @@ class DroneLink:
             return None
         with self._lock:
             return self._movement_block_reason(time.monotonic())
+
+    def video_ready(self):
+        """Whether the last fresh video receipt is within the existing timeout."""
+        if self.dry_run:
+            return False
+        with self._lock:
+            return self._video_ready(time.monotonic())
 
     def _movement_block_reason(self, now):
         """Caller holds _lock. A reason explains why requested keys send zero."""

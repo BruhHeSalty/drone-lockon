@@ -411,8 +411,8 @@ manual input does not repair the protocol or provide position hold.
 | 1 / 2 / 3 | Label the attempt steady / unstable / crash |
 
 Hold movement keys to request input; release to return that axis to neutral.
-Opposing keys cancel. Forward/sideways input is capped at 0.03, yaw/throttle
-at 0.08 (or lower configured limits). These are stick fractions, not measured
+Opposing keys cancel. All four manual keyboard axes are capped at 0.20
+(20% stick travel, or lower configured limits). These are stick fractions, not measured
 angles or speeds. There is no guarantee of stable hover or altitude retention.
 Losing window focus clears held input; sender-side input expires after 0.2s
 without a refresh. H requires releasing held keys before movement can restart.
@@ -423,13 +423,24 @@ The footer shows held keys, the takeoff countdown, and the reason movement is
 blocked (such as window focus or stale video). After T, release all keys and
 wait for `READY: manual input enabled` before requesting movement. READY means
 software permits input; it does not confirm hover or the drone's response.
+Person-confirmation messages describe the tracking display and never gate
+manual keys. A brief wait for the next camera frame preserves held-key input
+within the sender's existing 0.3-second video timeout. Releasing a key still
+centers its axis immediately; missing frames never refresh that timeout.
 
 The `INPUT` row shows capped pitch, roll, yaw and throttle requests; these are
 not measured movement. Video acknowledgement packets embed stick commands
 too. They now use the same current input and expiry checks as the RC sender,
 instead of interleaving neutral values with key inputs. Action flags such as
 takeoff/land are never copied into video acknowledgements. Physical response
-to this change is unverified; the stick caps have not been increased.
+to this transport change is unverified. Manual keyboard strength is configured
+separately by `DroneLink.KEYBOARD_LIMITS`.
+
+RC and video ACK headers retain Turbodrone's original packet numbering.
+The experimental shared command counter was reverted after runs with it
+received no fresh video. Startup reports `original Turbodrone packet numbering`;
+the journal marks this as `command_sequence: upstream`. Compatibility of a
+different numbering scheme has not been established on this F19.
 
 Operator labels are stored with the attempt number in the journal. R recordings
 are linked by filename and per-frame timestamps, allowing video to be compared

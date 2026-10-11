@@ -241,10 +241,12 @@ class FlightTests(unittest.TestCase):
         self.link.flying = True
         self.assertTrue(self.link.manual_input(dict(forward=1, right=-1, up=1, yaw=-1)))
         self.link._tick()
-        self.assertEqual(self.last_packet()['pitch'], 132)  # 3% input, not full stick
-        self.assertEqual(self.last_packet()['roll'], 124)
-        self.assertEqual(self.link.manual_command()['forward'], .03)
-        self.assertEqual(self.link.manual_command()['up'], .08)
+        self.assertEqual(self.last_packet()['pitch'], 153)  # 20% stick input
+        self.assertEqual(self.last_packet()['roll'], 103)
+        self.assertEqual(self.last_packet()['throttle'], 153)
+        self.assertEqual(self.last_packet()['yaw'], 103)
+        self.assertEqual(self.link.manual_command()['forward'], .20)
+        self.assertEqual(self.link.manual_command()['up'], .20)
         self.clock.return_value = 10.21
         self.link._tick()
         self.assertEqual(self.last_packet()['pitch'], 128)
@@ -276,7 +278,7 @@ class FlightTests(unittest.TestCase):
         with patch.object(config, 'CONTROL_PORT', None):
             preview = drone.DroneLink(flight_test=True)
         preview.manual_input(dict(forward=1, right=0, up=0, yaw=0))
-        self.assertEqual(preview.manual_command()['forward'], .03)
+        self.assertEqual(preview.manual_command()['forward'], .20)
         self.assertFalse(hasattr(preview, 'rc'))
 
     def test_manual_tracking_display_never_enables_autopilot(self):
@@ -310,6 +312,52 @@ class FlightTests(unittest.TestCase):
         link.land.assert_called_once()
         link.close.assert_called_once()
         window.close.assert_called_once()
+
+    def test_held_manual_keys_survive_frame_gap_but_release_and_stale_video_stop(self):
+        video, tracker, window = Mock(), Mock(), Mock()
+        video.kind, video.fresh = 'drone', True
+        frame = np.zeros((360, 640, 3), dtype=np.uint8)
+        tracker.find.return_value = dict(found=False, x=0, y=0, w=0, h=0, conf=0)
+        ticks = iter([10., 10.1, 10.15, 10.2, 10.31, 10.32])
+
+        def read():
+            self.clock.return_value = next(ticks)
+            return frame if self.clock.return_value == 10. else None
+
+        video.read.side_effect = read
+        window.key.side_effect = [-1, -1, -1, -1, -1, 27]
+        forward = dict(forward=1, right=0, yaw=0, up=0)
+        window.axes.side_effect = [forward, forward, dict(drone.HOVER), forward]
+        window.input_status.return_value = {'keys': ['w'], 'blocked_reason': None}
+        self.link.flying = True
+        packets = []
+        manual_input = self.link.manual_input
+
+        def send_input(axes):
+            result = manual_input(axes)
+            self.link._tick()
+            packets.append(self.last_packet()['pitch'])
+            return result
+
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            for context in (
+                patch.object(config, 'VIDEO_SOURCE', 'drone'),
+                patch.object(main, 'VideoSource', return_value=video),
+                patch.object(main, 'DroneLink', return_value=self.link),
+                patch.object(main, 'PersonTracker'),
+                patch.object(main, 'AsyncPersonTracker', return_value=tracker),
+                patch.object(main, 'ManualWindow', return_value=window),
+                patch.object(main.voice, 'announce'),
+                patch.object(self.link, 'manual_input', side_effect=send_input),
+                patch.object(self.link, 'close'),
+            ):
+                stack.enter_context(context)
+            main.main(manual=True)
+        self.assertEqual(packets, [153, 153, 128, 153, 128, 128])
+        self.assertEqual(tracker.find.call_count, 1)
+        self.assertEqual(self.link._video_time, 10.)  # Gaps never refresh freshness.
+        self.assertFalse(self.link.video_ready())
 
     def test_manual_respects_lower_configured_caps(self):
         self.ready()
@@ -555,6 +603,8 @@ class WirePacketTests(unittest.TestCase):
                     return packet[20:24]
 
                 self.assertEqual(ack_axes(), rc_axes)
+                link._tick()  # Interleave an RC send with the camera ACKs.
+                self.assertEqual(ack_axes(), rc_axes)
                 self.assertNotEqual(rc_axes, bytes([128] * 4))
                 link.manual_input(drone.HOVER)
                 self.assertEqual(ack_axes(), bytes([128] * 4))  # No sender tick needed after release.
@@ -573,6 +623,8 @@ class WirePacketTests(unittest.TestCase):
                 link.land()
                 self.assertEqual(ack_axes(), bytes([128] * 4))
                 self.assertTrue(link.sticks.land_flag)  # ACK does not consume the pending landing action.
+                link._tick()
+                self.assertEqual(sock.sent[-1][0][24], 1)  # Landing action survives sequencing.
 
     def test_real_encoder_takeoff_hover_forward_and_loss_with_fake_socket(self):
         # Exercise the actual installed packet encoder, with every socket and

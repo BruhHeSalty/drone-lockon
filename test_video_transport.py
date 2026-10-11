@@ -12,6 +12,30 @@ from drone import _LatestFrameVideo
 
 
 class VideoTransportTests(unittest.TestCase):
+    def test_video_only_requests_retain_upstream_numbering_and_bytes(self):
+        packet = bytearray(range(124))
+        packet[:2] = b'\xef\x02'
+        packet[4:8] = b'\x02\x02\x00\x01'
+        packet = bytes(packet)
+        sent = []
+
+        class Protocol:
+            def _safe_sendto(self, payload, port, label):
+                sent.append((payload, port, label))
+                return True
+
+        class Adapter(_LatestFrameVideo, Protocol):
+            pass
+
+        adapter = Adapter()
+        with patch.object(drone, '_shared_control_link', None):
+            self.assertTrue(adapter._safe_sendto(packet, 8800, 'video request'))
+            self.assertTrue(adapter._safe_sendto(packet, 8801, 'video request'))
+            self.assertTrue(adapter._safe_sendto(b'\xef\x00\x04\x00', 8800, 'start'))
+        self.assertEqual(sent, [(packet, 8800, 'video request'),
+                                (packet, 8801, 'video request'),
+                                (b'\xef\x00\x04\x00', 8800, 'start')])
+
     def test_inspection_saves_bounded_replies_without_a_flight_controller(self):
         for interrupted in (False, True):
             with self.subTest(interrupted=interrupted), tempfile.TemporaryDirectory() as directory:
