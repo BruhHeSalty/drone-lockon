@@ -1,5 +1,8 @@
 """Offline flight-safety regression tests. No camera, socket, or drone is opened."""
 import types
+import os
+import json
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -28,6 +31,7 @@ class FakeAdapter:
         self.sock = FakeSocket()
         self._target_ports = (8800, 8801)
         self.drone_ip = 'test-drone'
+        self.capabilities = types.SimpleNamespace(transport='uav_dual_port')
 
     def build_control_packet(self, sticks):
         packet = vars(sticks).copy()
@@ -50,8 +54,10 @@ class FlightTests(unittest.TestCase):
             patch.dict('sys.modules', {'protocols.wifi_uav_rc_protocol_adapter': module}),
             patch.object(drone, '_load_turbodrone'),
             patch.object(drone, '_shared_sock', None),
+            patch.object(drone, '_shared_control_link', None),
             patch.object(config, 'CONTROL_PORT', 8800),
             patch.object(drone.threading, 'Thread'),
+            patch.object(drone, 'FlightRecorder'),
         ):
             context.start()
             self.addCleanup(context.stop)
@@ -73,6 +79,47 @@ class FlightTests(unittest.TestCase):
         self.link.takeoff()
         self.assertEqual(self.link._takeoff_at, 10.0)
 
+    def test_short_attempt_is_suspected_failure_not_claimed_airtime(self):
+        self.ready()
+        self.link.takeoff()
+        self.link._tick()
+        self.clock.return_value = 17.
+        self.link.land()
+        summaries = [c for c in self.link._recorder.record.call_args_list if c.args[0] == 'attempt_end']
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0].kwargs['duration_s'], 7.)
+        self.assertEqual(summaries[0].kwargs['outcome'], 'suspected_failed')
+        self.assertFalse(summaries[0].kwargs['airborne_verified'])
+        self.link.kill()
+        self.assertEqual(len([c for c in self.link._recorder.record.call_args_list if c.args[0] == 'attempt_end']), 1)
+
+    def test_long_attempt_is_not_assumed_successful(self):
+        self.ready()
+        self.link.takeoff()
+        self.link._tick()
+        self.clock.return_value = 45.
+        self.link.land()
+        summary = [c for c in self.link._recorder.record.call_args_list if c.args[0] == 'attempt_end'][0]
+        self.assertEqual(summary.kwargs['outcome'], 'unverified')
+        self.assertFalse(summary.kwargs['airborne_verified'])
+
+    def test_control_journal_records_neutral_on_loss_and_socket_failure(self):
+        self.link.flight_test = False
+        self.link.flying = True
+        self.ready()
+        self.link.send(dict(yaw=0., up=0., forward=.08, right=0.))
+        self.link._tick()
+        self.link.video_lost()
+        self.link._tick()
+        packets = [c.kwargs for c in self.link._recorder.record.call_args_list if c.args[0] == 'control_packet']
+        self.assertEqual(packets[0]['sticks']['pitch'], 138)
+        self.assertEqual(packets[-1]['command'], drone.HOVER)
+        self.link.rc.sock.fail = True
+        self.link._tick()
+        packet = [c.kwargs for c in self.link._recorder.record.call_args_list if c.args[0] == 'control_packet'][-1]
+        self.assertFalse(packet['locally_accepted'])
+        self.assertIn('simulated', packet['error'])
+
     def test_one_recent_frame_allows_takeoff_without_one_second_wait(self):
         self.link.note_frame()
         self.link.takeoff()
@@ -93,6 +140,32 @@ class FlightTests(unittest.TestCase):
         self.assertTrue(self.link.flying)
         self.link._tick()
         self.assertFalse(self.last_packet()['takeoff_flag'])
+
+    def test_takeoff_discards_old_motion_and_readiness_waits_for_hold(self):
+        self.link.flight_test = False
+        self.ready()
+        self.link.send(dict(yaw=-.15, up=0., forward=.08, right=-.1))
+        self.link.takeoff()
+        self.assertEqual(self.link._cmd, drone.HOVER)
+        self.link._tick()
+        self.assertIn('takeoff hold', self.link.tracking_block_reason())
+        for now in (10., 11., 12.99):
+            self.clock.return_value = now
+            self.link.note_frame()
+            self.link.send(dict(yaw=-.15, up=0., forward=.08, right=-.1))
+            self.link._tick()
+            for axis in ('yaw', 'pitch', 'throttle', 'roll'):
+                self.assertEqual(self.last_packet()[axis], 128)
+        self.clock.return_value = 13.01
+        self.link.note_frame()
+        self.link.hover()
+        self.assertIsNone(self.link.tracking_block_reason())
+        self.link._tick()
+        self.assertEqual(self.last_packet()['roll'], 128)
+        self.link.video_lost()
+        self.assertIn('video', self.link.tracking_block_reason())
+        self.link._control_fault = True
+        self.assertIn('unavailable', self.link.tracking_block_reason())
 
     def test_space_cancels_pending_takeoff(self):
         self.ready()
@@ -128,6 +201,21 @@ class FlightTests(unittest.TestCase):
         for axis in ('yaw', 'pitch', 'throttle', 'roll'):
             self.assertEqual(self.last_packet()[axis], 128)
 
+    def test_follow_forward_reaches_stick_packet_and_video_loss_neutralizes(self):
+        # Fake adapter/socket only: verify the new controller's forward output
+        # has an actual control path, and retains the video-loss stop.
+        self.link = drone.DroneLink(flight_test=False)
+        self.ready()
+        self.link.flying = True
+        self.link.send(dict(yaw=0., up=0., forward=.08, right=0.))
+        self.link._tick()
+        self.assertEqual(self.last_packet()['pitch'], drone._stick(.08))
+        for axis in ('yaw', 'throttle', 'roll'):
+            self.assertEqual(self.last_packet()[axis], 128)
+        self.link.video_lost()
+        self.link._tick()
+        self.assertEqual(self.last_packet()['pitch'], 128)
+
     def test_manual_axes_are_capped_and_expire(self):
         self.ready()
         self.link.flying = True
@@ -148,6 +236,81 @@ class FlightTests(unittest.TestCase):
             self.assertEqual(self.last_packet()[axis], 128)
         self.assertEqual(self.link.manual_command(), drone.HOVER)
 
+    def test_held_keys_never_send_full_sticks_and_expire_on_ui_stall(self):
+        self.ready()
+        self.link.flying = True
+        self.assertTrue(self.link.manual_input(dict(forward=1, right=-1, up=1, yaw=-1)))
+        self.link._tick()
+        self.assertEqual(self.last_packet()['pitch'], 132)  # 3% input, not full stick
+        self.assertEqual(self.last_packet()['roll'], 124)
+        self.assertEqual(self.link.manual_command()['forward'], .03)
+        self.assertEqual(self.link.manual_command()['up'], .08)
+        self.clock.return_value = 10.21
+        self.link._tick()
+        self.assertEqual(self.last_packet()['pitch'], 128)
+        self.assertEqual(self.last_packet()['throttle'], 128)
+
+    def test_manual_release_fault_loss_and_lower_caps(self):
+        self.ready()
+        self.link.flying = True
+        with patch.object(config, 'MAX_FORWARD', .01):
+            self.link.manual_input(dict(forward=1, right=1, up=0, yaw=0))
+            self.assertEqual(self.link.manual_command()['forward'], .01)
+            self.assertEqual(self.link.manual_command()['right'], .01)
+        self.link.manual_input(drone.HOVER)
+        self.assertEqual(self.link.manual_command(), drone.HOVER)
+        self.link.video_lost()
+        self.assertFalse(self.link.manual_input(dict(forward=1, right=0, up=0, yaw=0)))
+        self.assertEqual(self.link._manual_cmd, drone.HOVER)
+        self.ready()
+        self.link._control_fault = True
+        self.assertFalse(self.link.manual_input(dict(forward=1, right=0, up=0, yaw=0)))
+
+    def test_manual_invalid_input_neutralizes_and_preview_needs_no_socket(self):
+        self.ready()
+        self.link.flying = True
+        self.link.manual_input(dict(forward=1, right=0, up=0, yaw=0))
+        with self.assertRaises(ValueError):
+            self.link.manual_input(dict(forward=float('nan'), right=0, up=0, yaw=0))
+        self.assertEqual(self.link.manual_command(), drone.HOVER)
+        with patch.object(config, 'CONTROL_PORT', None):
+            preview = drone.DroneLink(flight_test=True)
+        preview.manual_input(dict(forward=1, right=0, up=0, yaw=0))
+        self.assertEqual(preview.manual_command()['forward'], .03)
+        self.assertFalse(hasattr(preview, 'rc'))
+
+    def test_manual_tracking_display_never_enables_autopilot(self):
+        video, link, tracker, window = Mock(), Mock(), Mock(), Mock()
+        video.kind, video.fresh = 'drone', True
+        video.read.return_value = np.zeros((360, 640, 3), dtype=np.uint8)
+        tracker.find.return_value = dict(found=True, x=.8, y=.5, w=.1, h=.2, conf=.95)
+        link.manual_command.return_value = dict(drone.HOVER)
+        window.key.side_effect = [-1, ord('1'), ord(' '), 27]
+        window.axes.return_value = dict(forward=1, right=0, yaw=-1, up=0)
+        window.input_status.return_value = {'keys': ['w', 'q'], 'blocked_reason': None}
+        link.manual_status.return_value = 'READY: manual input enabled (hover unverified)'
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            for context in (
+                patch.object(config, 'VIDEO_SOURCE', 'drone'),
+                patch.object(main, 'VideoSource', return_value=video),
+                patch.object(main, 'DroneLink', return_value=link),
+                patch.object(main, 'PersonTracker'),
+                patch.object(main, 'AsyncPersonTracker', return_value=tracker),
+                patch.object(main, 'ManualWindow', return_value=window),
+                patch.object(main.voice, 'announce', side_effect=lambda *args, **kw: self.assertTrue(kw.get('visual_only'))),
+            ):
+                stack.enter_context(context)
+            main.main(manual=True)
+        self.assertEqual(tracker.find.call_count, 4)
+        link.send.assert_not_called()
+        self.assertEqual(link.manual_input.call_args_list[0].args[0]['yaw'], -1)
+        self.assertEqual(link.manual_input.call_args_list[-1].args[0], drone.HOVER)
+        link.record_event.assert_any_call('operator_flight_label', label='steady', source='operator', airborne_verified=False)
+        link.land.assert_called_once()
+        link.close.assert_called_once()
+        window.close.assert_called_once()
+
     def test_manual_respects_lower_configured_caps(self):
         self.ready()
         self.link.flying = True
@@ -155,6 +318,26 @@ class FlightTests(unittest.TestCase):
             self.link.manual_nudge('right', 1)
             self.link._tick()
         self.assertEqual(self.last_packet()['roll'], drone._stick(0.05))
+
+    def test_blocked_key_requests_are_logged_during_takeoff_hold(self):
+        self.ready()
+        self.link.takeoff()
+        self.link._tick()
+        axes = dict(forward=1, right=0, yaw=0, up=0)
+        self.assertFalse(self.link.manual_input(axes))
+        self.assertIn('3.0s remaining', self.link.manual_status())
+        calls = [c.kwargs for c in self.link._recorder.record.call_args_list if c.args[0] == 'manual_input']
+        self.assertEqual(calls[-1]['requested_axes'], axes)
+        self.assertEqual(calls[-1]['command'], drone.HOVER)
+        self.assertIn('takeoff hold', calls[-1]['blocked_reason'])
+        self.link.manual_input(axes)
+        self.assertEqual(len([c for c in self.link._recorder.record.call_args_list if c.args[0] == 'manual_input']), len(calls))
+        self.clock.return_value = 13.1
+        self.link.note_frame()
+        self.assertTrue(self.link.manual_input(axes))
+        self.assertIn('READY', self.link.manual_status())
+        self.link.land()
+        self.assertIn('session ended', self.link.manual_status())
 
     def test_manual_blocked_on_ground_during_takeoff_and_without_video(self):
         self.ready()
@@ -313,6 +496,191 @@ class FlightTests(unittest.TestCase):
         link.video_lost.assert_not_called()
         self.assertEqual(link.hover.call_count, 1)  # T explicitly neutralizes, missing frames do not.
         link.close.assert_called_once()
+
+
+@unittest.skipUnless(os.path.isdir(os.path.expanduser(config.TURBODRONE_PATH)),
+                     'optional Turbodrone checkout is not installed')
+class WirePacketTests(unittest.TestCase):
+    def test_native_video_requests_match_rc_and_clear_on_release_loss_and_land(self):
+        drone._load_turbodrone()
+        from protocols.wifi_uav_rc_protocol_adapter import WifiUavRcProtocolAdapter
+        from utils.wifi_uav_packets import build_native_ack_packet, build_ack_slot
+        from contextlib import ExitStack
+        for variant in ('uav', 'fld'):
+            with self.subTest(variant=variant), ExitStack() as stack:
+                sock = FakeSocket()
+                adapter = WifiUavRcProtocolAdapter(shared_sock=sock, variant=variant)
+                for context in (
+                    patch('protocols.wifi_uav_rc_protocol_adapter.WifiUavRcProtocolAdapter', return_value=adapter),
+                    patch.object(config, 'CONTROL_PORT', 8800),
+                    patch.object(drone, '_shared_sock', sock),
+                    patch.object(drone, '_shared_control_link', None),
+                    patch.object(drone.threading, 'Thread'),
+                    patch.object(drone, 'FlightRecorder'),
+                ):
+                    stack.enter_context(context)
+                clock = stack.enter_context(patch.object(drone.time, 'monotonic', return_value=10.))
+                link = drone.DroneLink(flight_test=True)
+                link.note_frame()
+                link.takeoff()
+                link._tick()
+                clock.return_value = 13.1
+                link.note_frame()
+                link.manual_input(dict(yaw=-1, forward=1, up=1, right=1))
+                link._tick()
+                rc_axes = sock.sent[-1][0][20:24]
+                request = build_native_ack_packet(123, [build_ack_slot(123, 3)])
+
+                class Protocol:
+                    def _safe_sendto(self, payload, port, label):
+                        sock.sendto(payload, ('test-drone', port))
+                        return True
+
+                class Video(drone._LatestFrameVideo, Protocol):
+                    pass
+
+                video = Video()
+                video._sock = sock
+
+                def ack_axes():
+                    video._safe_sendto(request, 8800, 'test ACK')
+                    packet = sock.sent[-1][0]
+                    self.assertEqual(packet[:20], request[:20])
+                    self.assertEqual(packet[37:], request[37:])
+                    self.assertEqual(packet[24], 0)  # Never replay a one-key action.
+                    checksum = 0
+                    for value in packet[20:36]:
+                        checksum ^= value
+                    self.assertEqual(packet[36], checksum)
+                    return packet[20:24]
+
+                self.assertEqual(ack_axes(), rc_axes)
+                self.assertNotEqual(rc_axes, bytes([128] * 4))
+                link.manual_input(drone.HOVER)
+                self.assertEqual(ack_axes(), bytes([128] * 4))  # No sender tick needed after release.
+                link.manual_input(dict(yaw=0, forward=1, up=0, right=0))
+                clock.return_value += .21
+                self.assertEqual(ack_axes(), bytes([128] * 4))
+                link.note_frame()
+                link.manual_input(dict(yaw=0, forward=1, up=0, right=0))
+                link.video_lost()
+                self.assertEqual(ack_axes(), bytes([128] * 4))
+                link.note_frame()
+                link.manual_input(dict(yaw=0, forward=1, up=0, right=0))
+                link._control_fault = True
+                self.assertEqual(ack_axes(), bytes([128] * 4))
+                link._control_fault = False
+                link.land()
+                self.assertEqual(ack_axes(), bytes([128] * 4))
+                self.assertTrue(link.sticks.land_flag)  # ACK does not consume the pending landing action.
+
+    def test_real_encoder_takeoff_hover_forward_and_loss_with_fake_socket(self):
+        # Exercise the actual installed packet encoder, with every socket and
+        # sender thread replaced. This does not communicate with a drone.
+        drone._load_turbodrone()
+        from protocols.wifi_uav_rc_protocol_adapter import WifiUavRcProtocolAdapter
+        sock = FakeSocket()
+        adapter = WifiUavRcProtocolAdapter(shared_sock=sock, variant='uav')
+        with patch('protocols.wifi_uav_rc_protocol_adapter.WifiUavRcProtocolAdapter', return_value=adapter), \
+             patch.object(config, 'CONTROL_PORT', 8800), \
+             patch.object(drone, '_shared_sock', None), \
+             patch.object(drone, '_shared_control_link', None), \
+             patch.object(drone.threading, 'Thread'), \
+             patch.object(drone, 'FlightRecorder'), \
+             patch.object(drone.time, 'monotonic', return_value=10.) as clock:
+            link = drone.DroneLink()
+            link.note_frame()
+            link.takeoff()
+            for now in (10., 11., 12.99, 13.01, 20.):
+                clock.return_value = now
+                link.note_frame()
+                link.hover()
+                link._tick()
+                packet = sock.sent[-1][0]
+                self.assertEqual(packet[20:24], bytes([128] * 4))
+                self.assertEqual(packet[24], 1 if now == 10. else 0)
+                self.assertEqual(packet[25], 2)  # headless remains off
+            link.send(dict(yaw=0., up=0., forward=.08, right=0.))
+            link._tick()
+            self.assertEqual(sock.sent[-1][0][20:24], bytes([128, 138, 128, 128]))
+            link.video_lost()
+            link._tick()
+            self.assertEqual(sock.sent[-1][0][20:24], bytes([128] * 4))
+            link.land()
+            link._tick()
+            self.assertEqual(sock.sent[-1][0][24], 1)
+
+
+class JournalTests(unittest.TestCase):
+    def test_json_lines_survive_close_with_timestamps_and_diagnostic_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = drone.FlightRecorder(directory)
+            recorder.record('takeoff_requested', airborne_verified=False)
+            recorder.record('hover_key', position_hold_verified=False)
+            recorder.close()
+            recorder.close()
+            rows = [json.loads(line) for line in recorder.path.read_text().splitlines()]
+            self.assertEqual([r['event'] for r in rows], ['takeoff_requested', 'hover_key', 'journal_end'])
+            self.assertTrue(all('utc' in r and 'elapsed_s' in r for r in rows))
+            self.assertFalse(rows[0]['airborne_verified'])
+            self.assertEqual(rows[-1]['dropped_events'], 0)
+            self.assertFalse(recorder._thread.is_alive())
+
+
+class ManualKeyboardTests(unittest.TestCase):
+    def setUp(self):
+        self.window = main.ManualWindow.__new__(main.ManualWindow)
+        self.window.root = Mock()
+        self.window.held = set()
+        self.window.actions = []
+        self.window.inhibited = self.window.closed = False
+
+    def press(self, *keys):
+        for key in keys:
+            self.window._press(types.SimpleNamespace(keysym=key))
+
+    def release(self, *keys):
+        for key in keys:
+            self.window._release(types.SimpleNamespace(keysym=key))
+
+    def test_axes_modifiers_releases_and_opposite_keys(self):
+        self.press('w', 'a', 'q', 'Shift_L')
+        self.assertEqual(self.window.axes(), dict(forward=1, right=-1, yaw=-1, up=1))
+        self.assertEqual(self.window.key(), -1)  # Q does not quit; A does not arm.
+        self.press('s', 'd', 'e', 'Control_L')
+        self.assertEqual(self.window.axes(), drone.HOVER)
+        self.release('s', 'd', 'e', 'Control_L', 'w', 'a', 'q', 'Shift_L')
+        self.assertEqual(self.window.axes(), drone.HOVER)
+
+    def test_neutral_and_focus_loss_cancel_held_inputs(self):
+        self.press('w', 'h')
+        self.assertEqual(self.window.axes(), drone.HOVER)
+        self.release('h')
+        self.press('w')  # OS repeat cannot restart a held input after H.
+        self.assertEqual(self.window.axes(), drone.HOVER)
+        self.release('w')
+        self.press('w')
+        self.assertEqual(self.window.axes()['forward'], 1)
+        self.window._focus_out()
+        self.assertEqual(self.window.axes(), drone.HOVER)
+        self.assertEqual(self.window.key(), ord('h'))
+        self.press('w')
+        self.window.root.focus_displayof.return_value = None
+        self.assertEqual(self.window.axes(), drone.HOVER)
+
+    def test_emergency_actions_override_queued_takeoff(self):
+        self.press('t', 'l')
+        self.assertEqual(self.window.key(), ord(' '))
+        self.assertEqual(self.window.key(), -1)
+        self.assertEqual(self.window.axes(), drone.HOVER)
+        self.release('t', 'l')
+        self.press('t', 'space', 'k')
+        self.assertEqual(self.window.key(), ord('k'))
+        self.assertEqual(self.window.key(), -1)
+        self.release('t', 'space', 'k')
+        self.press('k')
+        self.window._focus_out()
+        self.assertEqual(self.window.key(), ord('k'))
 
 
 if __name__ == '__main__':

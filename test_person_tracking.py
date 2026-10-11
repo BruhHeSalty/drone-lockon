@@ -37,7 +37,7 @@ class PersonTests(unittest.TestCase):
         with patch.object(config, 'MAX_YAW', .04):
             self.assertEqual(Controller(person_mode=True).update(target())[0]['yaw'], .04)
 
-    def test_live_tracking_never_reacquires_another_id(self):
+    def test_selection_survives_leaving_frame_and_reacquires_new_id(self):
         tracker = PersonTracker.__new__(PersonTracker)
         tracker.allow_live_yaw = True
         tracker._tracks = {}
@@ -47,6 +47,7 @@ class PersonTests(unittest.TestCase):
         tracker._pending_id = 7
         tracker._reference = np.ones(3)
         tracker._previous_live = None
+        tracker._visible = True
         tracker._last_confirmed = time.monotonic()
         tracker.tracker_config = "botsort.yaml"
         tracker.person_class = 0
@@ -57,13 +58,24 @@ class PersonTests(unittest.TestCase):
         boxes.xyxy.cpu.return_value.tolist.return_value = [[10, 10, 30, 60]]
         boxes.conf.cpu.return_value.tolist.return_value = [.9]
         tracker.model = Mock()
-        tracker.model.track.return_value = [types.SimpleNamespace(boxes=boxes)]
+        tracker.model.track.return_value = [types.SimpleNamespace(boxes=None)]
         frame = np.zeros((100, 100, 3), dtype=np.uint8)
-        with patch.object(tracker, '_choose_match', return_value=8):
+        reference = tracker._reference
+        with patch('vision.time.monotonic', return_value=tracker._last_confirmed + 3600):
+            for _ in range(5):
+                result = tracker.find(frame)
+                self.assertFalse(result['found'])
+                self.assertEqual(Controller(person_mode=True).update(result)[0], HOVER)
+        self.assertEqual(tracker._selected_id, 7)
+        self.assertIs(tracker._reference, reference)
+        self.assertIn('remembered', tracker.status)
+        tracker.model.track.return_value = [types.SimpleNamespace(boxes=boxes)]
+        with patch.object(tracker, '_appearance', return_value=np.ones(3)):
             self.assertFalse(tracker.find(frame)['found'])
-        self.assertIsNone(tracker._selected_id)
-        self.assertIsNone(tracker._reference)
-        self.assertFalse(tracker.find(frame)['found'])
+            self.assertFalse(tracker.find(frame)['found'])
+            self.assertTrue(tracker.find(frame)['found'])
+        self.assertEqual(tracker._selected_id, 8)
+        self.assertIs(tracker._reference, reference)
 
     def test_slow_detection_does_not_block_and_result_age_includes_inference(self):
         entered, release = threading.Event(), threading.Event()
@@ -108,7 +120,7 @@ class PersonTests(unittest.TestCase):
              patch.object(main, 'VideoSource', return_value=video), \
              patch.object(main, 'DroneLink', return_value=link), \
              patch.object(main.voice, 'announce'), \
-             patch.object(main.hud, 'draw', return_value=frame), \
+             patch.object(main.hud, 'draw', return_value=frame) as draw, \
              patch.object(main.cv2, 'namedWindow'), \
              patch.object(main.cv2, 'setMouseCallback'), \
              patch.object(main.cv2, 'imshow'), \
@@ -122,6 +134,15 @@ class PersonTests(unittest.TestCase):
         link.land.assert_called_once()
         link.close.assert_called_once()
         worker.close.assert_called_once()
+        # Dropped camera frames still render the controls/status, but they must
+        # not retain a visible lock or an old steering command.
+        self.assertEqual(draw.call_count, 4)
+        for call in draw.call_args_list[2:]:
+            self.assertFalse(call.args[1]['found'])
+            self.assertEqual(call.args[2], 'LOST')
+            self.assertEqual(call.args[3], HOVER)
+        self.assertEqual([c.kwargs['video_fresh'] for c in worker.draw_candidates.call_args_list],
+                         [True, True, False, False])
 
     def test_capture_delay_counts_toward_detection_expiry(self):
         detector = Mock()
@@ -140,20 +161,74 @@ class PersonTests(unittest.TestCase):
         displayed = np.zeros((100, 100, 3), dtype=np.uint8)
         worker._result = (time.monotonic(), dict(NOT_FOUND))
         worker._snapshot = (displayed, {7: target()}, 'Select')
-        worker.set_color_from_pixel(displayed, 80, 20)
+        worker.draw_candidates(displayed.copy())
+        self.assertIs(worker.set_color_from_pixel(displayed, 80, 20), True)
         self.assertEqual(worker._click[0], 7)
         self.assertEqual(worker._generation, 1)
         self.assertFalse(worker._result[1]['found'])
         detector.find.assert_not_called()
+
+    def test_click_uses_displayed_box_when_worker_has_already_moved_on(self):
+        detector = Mock()
+        detector._appearance.return_value = np.ones(3)
+        with patch('vision.threading.Thread'):
+            worker = AsyncPersonTracker(detector)
+        displayed = np.zeros((100, 100, 3), dtype=np.uint8)
+        worker._result = (time.monotonic(), dict(NOT_FOUND))
+        worker._snapshot = (displayed, {7: target()}, 'Select')
+        worker.draw_candidates(displayed.copy())
+        # Inference finishes between imshow and the mouse callback. Its person
+        # is elsewhere; that must not change the meaning of the visible box.
+        worker._snapshot = (displayed.copy(), {8: target(x=.2)}, 'Select')
+        worker._result = (time.monotonic(), dict(NOT_FOUND))
+        worker.set_color_from_pixel(displayed, 80, 20)
+        self.assertEqual(worker._click[0], 7)
+        self.assertIs(detector._appearance.call_args.args[0], displayed)
+        self.assertIn('Selected person 7', worker._click_notice)
+        self.assertFalse(worker._result[1]['found'])
+
+    def test_fresh_worker_result_cannot_make_an_expired_display_clickable(self):
+        detector = Mock()
+        with patch('vision.threading.Thread'):
+            worker = AsyncPersonTracker(detector)
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        worker._result = (10., dict(NOT_FOUND))
+        worker._snapshot = (frame, {7: target()}, 'Select')
+        with patch('vision.time.monotonic', return_value=10.1):
+            worker.draw_candidates(frame.copy())
+        worker._result = (10.4, dict(NOT_FOUND))
+        with patch('vision.time.monotonic', return_value=10.4):
+            self.assertFalse(worker.set_color_from_pixel(frame, 80, 20))
+        self.assertIsNone(worker._click)
+        detector._appearance.assert_not_called()
+
+    def test_video_gap_clears_clickable_overlay_even_with_a_recent_detection(self):
+        detector = Mock()
+        with patch('vision.threading.Thread'):
+            worker = AsyncPersonTracker(detector)
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        worker._result = (time.monotonic(), dict(NOT_FOUND))
+        worker._snapshot = (frame, {7: target()}, 'Select')
+        worker.draw_candidates(frame.copy())
+        self.assertIsNotNone(worker._displayed)
+        worker.draw_candidates(frame.copy(), video_fresh=False)
+        worker.set_color_from_pixel(frame, 80, 20)
+        self.assertIsNone(worker._displayed)
+        self.assertIsNone(worker._click)
+        detector._appearance.assert_not_called()
 
     def test_same_clothing_elsewhere_does_not_break_selected_id(self):
         tracker = PersonTracker.__new__(PersonTracker)
         tracker.allow_live_yaw = True
         tracker._reference = np.ones(3)
         tracker._selected_id = 7
+        tracker._visible = True
         tracker._tracks = {7: target(x=.2), 8: target(x=.8)}
         with patch.object(tracker, '_appearance', return_value=np.ones(3)):
             self.assertEqual(tracker._choose_match(np.zeros((100, 100, 3))), 7)
+            tracker._visible = False  # Once lost, same clothes are ambiguous.
+            self.assertIsNone(tracker._choose_match(np.zeros((100, 100, 3))))
+            tracker._visible = True
             tracker._tracks[8] = target(x=.2)
             self.assertIsNone(tracker._choose_match(np.zeros((100, 100, 3))))
 
@@ -169,6 +244,7 @@ class PersonTests(unittest.TestCase):
         tracker._pending_id = 7
         tracker._reference = np.ones(3)
         tracker._previous_live = None
+        tracker._visible = True
         tracker._last_confirmed = time.monotonic()
         boxes = Mock()
         boxes.id.cpu.return_value.tolist.return_value = [7]
@@ -188,7 +264,32 @@ class PersonTests(unittest.TestCase):
         boxes.conf.cpu.return_value.tolist.return_value = [.3]
         with patch('vision.time.monotonic', return_value=tracker._last_confirmed + .51):
             self.assertFalse(tracker.find(frame)['found'])
-        self.assertIsNone(tracker._selected_id)
+        self.assertEqual(tracker._selected_id, 7)
+        self.assertIsNotNone(tracker._reference)
+
+    def test_reacquisition_rejects_wrong_appearance_and_weak_candidates(self):
+        tracker = PersonTracker.__new__(PersonTracker)
+        tracker._reference = np.array([1., 0.])
+        tracker._selected_id = 7
+        tracker._visible = False
+        tracker._tracks = {8: target()}
+        frame = np.zeros((100, 100, 3))
+        with patch.object(tracker, '_appearance', return_value=np.array([0., 1.])):
+            self.assertIsNone(tracker._choose_match(frame))
+        tracker._tracks[8] = target(conf=.3)
+        with patch.object(tracker, '_appearance', return_value=np.array([1., 0.])):
+            self.assertIsNone(tracker._choose_match(frame))
+        self.assertEqual(tracker._selected_id, 7)
+        np.testing.assert_array_equal(tracker._reference, [1., 0.])
+
+    def test_explicit_reselection_replaces_remembered_target(self):
+        tracker = PersonTracker.__new__(PersonTracker)
+        tracker._selected_id = 7
+        tracker._reference = np.array([1., 0.])
+        tracker.select_track(8, target(), np.array([0., 1.]))
+        self.assertEqual(tracker._selected_id, 8)
+        self.assertEqual(tracker._consistent, 0)
+        np.testing.assert_array_equal(tracker._reference, [0., 1.])
 
     def test_invalid_model_settings_fail_before_loading_model(self):
         with self.assertRaises(ValueError):

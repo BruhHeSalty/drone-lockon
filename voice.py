@@ -1,20 +1,26 @@
-"""OWNER: Person 3 — Jarvis-style voice callouts using ElevenLabs TTS.
+"""OWNER: Person 3 — offline Mac / ElevenLabs voice callouts.
 
-Speaks "Target acquired" (with a color description) when the lock-on first
+Speaks "Target acquired" (with position and size descriptions) when the lock-on first
 engages, and "Target lost" when the lock drops. Runs TTS in a background
-thread so it never blocks the video loop.
+thread so it never blocks the video loop. Drone video uses macOS speech without
+internet or an API key. Other sources use ElevenLabs with a Mac fallback.
 
-Setup:
+Optional cloud voice setup:
   pip install elevenlabs
   export ELEVENLABS_API_KEY="your-key-here"
 """
 import os
 import random
+import shutil
+import subprocess
 import threading
 import time
 
+import config
+
 _eleven = None
 _voice_id = None
+_speech_lock = threading.Lock()
 
 
 def _init():
@@ -24,17 +30,16 @@ def _init():
         return True
     try:
         from elevenlabs.client import ElevenLabs
-        from elevenlabs import play
     except ImportError:
-        print("[voice] elevenlabs not installed — pip install elevenlabs")
+        print("[voice] ElevenLabs not installed; trying offline speech")
         return False
 
     key = os.environ.get("ELEVENLABS_API_KEY")
     if not key:
-        print("[voice] set ELEVENLABS_API_KEY to enable voice")
+        print("[voice] No ElevenLabs key; trying offline speech")
         return False
 
-    _eleven = ElevenLabs(api_key=key)
+    _eleven = ElevenLabs(api_key=key, timeout=3.0)
     # Default voice — change this to any ElevenLabs voice ID you like.
     # "Adam" is a good deep/calm option. Browse voices at elevenlabs.io.
     _voice_id = os.environ.get("ELEVENLABS_VOICE_ID", "pNInz6obpgDQGcFmaJgB")  # Adam
@@ -42,38 +47,72 @@ def _init():
     return True
 
 
-def _speak(text):
-    """Generate and play TTS audio (blocking — call from a thread)."""
+def _speak_local(text):
+    """macOS speech works on the drone's Wi-Fi, without a cloud request."""
+    say = shutil.which("say")
+    if say is None:
+        return False
     try:
-        import io
+        subprocess.run([say, text], check=True, timeout=10,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"[voice] Offline speech failed ({type(exc).__name__})")
+        return False
+
+
+def _speak(text):
+    """Generate/play speech in the worker; never require internet on drone Wi-Fi."""
+    if config.VIDEO_SOURCE == "drone" and shutil.which("say"):
+        _speak_local(text)
+        return
+    try:
+        if not _init():
+            _speak_local(text)
+            return
         import sounddevice as sd
-        import soundfile as sf
 
         audio = _eleven.text_to_speech.convert(
             text=text,
             voice_id=_voice_id,
             model_id="eleven_turbo_v2",
             output_format="pcm_24000",
+            request_options={"max_retries": 0, "timeout_in_seconds": 3},
         )
         # audio is a generator of bytes — collect it
         raw = b"".join(audio)
         import numpy as np
         samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
         sd.play(samples, samplerate=24000, blocking=True)
-    except Exception as e:
-        print(f"[voice] TTS error: {e}")
+    except Exception as exc:
+        print(f"[voice] Cloud speech unavailable ({type(exc).__name__}); trying offline speech")
+        _speak_local(text)
 
 
 def _speak_async(text):
-    """Fire-and-forget TTS in a daemon thread."""
-    t = threading.Thread(target=_speak, args=(text,), daemon=True)
-    t.start()
+    """One speaker, no queue of stale callouts and no overlapping playback."""
+    if not _speech_lock.acquire(blocking=False):
+        return False
+
+    def run():
+        try:
+            _speak(text)
+        finally:
+            _speech_lock.release()
+
+    try:
+        threading.Thread(target=run, daemon=True).start()
+    except Exception:
+        _speech_lock.release()
+        raise
+    return True
 
 
 # --- State tracking for the main loop ---
 
 _last_state = None
 _last_speak_time = 0.0
+_pending_text = None
 _MIN_INTERVAL = 3.0  # don't spam callouts faster than this
 
 
@@ -142,21 +181,20 @@ _REACQUIRED_LINES = [
 ]
 
 
-def announce(state, frame=None, target=None):
+def announce(state, frame=None, target=None, visual_only=False):
     """Call every frame from main.py. Speaks on state transitions."""
-    global _last_state, _last_speak_time
+    global _last_state, _pending_text
+
+    # Manual mode describes the camera only. A large box is not proof of
+    # arrival, hovering, or physical motion toward the person.
+    if visual_only and state in ('APPROACHING', 'REACHED'):
+        state = 'LOCKED'
 
     if state == _last_state:
+        _flush_pending()
         return
     prev = _last_state
     _last_state = state
-
-    if not _init():
-        return
-
-    now = time.time()
-    if now - _last_speak_time < _MIN_INTERVAL:
-        return
 
     desc = ""
     if frame is not None and target is not None and target.get("found"):
@@ -174,9 +212,19 @@ def announce(state, frame=None, target=None):
     elif state == "REACHED":
         text = random.choice(_REACHED_LINES)
     elif state == "LOST" and prev in ("LOCKED", "APPROACHING", "REACHED"):
-        text = random.choice(_LOST_LINES)
+        text = 'Visual target lost.' if visual_only else random.choice(_LOST_LINES)
 
-    if text:
-        _last_speak_time = now
-        print(f"[voice] {text}")
-        _speak_async(text)
+    # Keep only the current state's callout. A short-lived state must not
+    # suppress a later stable lock merely because the speaker was busy.
+    _pending_text = text
+    _flush_pending()
+
+
+def _flush_pending():
+    global _last_speak_time, _pending_text
+    now = time.monotonic()
+    if _pending_text is not None and now - _last_speak_time >= _MIN_INTERVAL:
+        if _speak_async(_pending_text):
+            _last_speak_time = now
+            print(f"[voice] {_pending_text}")
+            _pending_text = None

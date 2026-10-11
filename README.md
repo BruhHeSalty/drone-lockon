@@ -290,11 +290,15 @@ unlikely jumps and requires another click after a one-second loss.
 
 ## Optional voice
 
-`voice.py` is included and imports without the ElevenLabs package. Voice is
-optional; its missing-package/key messages do not stop the video loop.
-To enable it separately, install `elevenlabs` in the same environment and set
+On Mac, drone-camera mode uses built-in `say` speech: no internet, ElevenLabs
+package, or API key is required. Callouts play through the Mac's audio output.
+Voice runs in the background and does not overlap or queue old state changes.
+
+Other video sources use ElevenLabs when available, with Mac speech as a
+fallback. For cloud voice, install `elevenlabs` in the same environment and set
 `ELEVENLABS_API_KEY` locally. Do not commit keys. Cloud voice needs internet,
-which the drone Wi-Fi generally does not provide.
+which the drone Wi-Fi generally does not provide. Missing voice dependencies
+do not stop the video loop; offline speech currently requires macOS `say`.
 
 ## Keys
 
@@ -330,7 +334,9 @@ formats unchanged. Only edit your assigned code unless the team agrees otherwise
 - Autopilot starts OFF. SPACE requests landing; K stops motors.
 - Lost target → neutral/hover commands immediately. Never keep flying blind.
 - Close target → stop forward motion. Image size does not guarantee 1–2 metres.
-- Never fly at people. Live person mode turns only; it never commands approach or altitude changes.
+- `--person` turns only; it never commands approach or altitude changes.
+  `--follow` is a separate experimental mode with limited forward movement,
+  described below. Never fly into a person; box size is not a distance sensor.
 - Verify video first, with props off. Live flight behavior needs separate testing.
 
 ## Person tracking on the drone feed
@@ -341,6 +347,124 @@ Click a yellow person box, then press `A` to enable yaw tracking. Autopilot star
 off. `T` requests takeoff, `H` cancels tracking and requests neutral sticks, and
 `SPACE` requests landing. There are no forward, sideways or altitude commands
 in this mode. Neutral sticks can still drift; physical flight testing is required.
+
+### Following is currently preview-only
+
+**Live `--follow` is disabled after reports of uncontrolled forward movement
+and altitude loss.** It exits before loading the model or opening the camera
+or control connection. The earlier live launch command must not be used for
+another flight. Centered sticks have not been verified to hold this F19 in
+position or at altitude; a three-second delay cannot establish stable hover.
+
+Tracking/following logic can still be previewed without RC commands:
+
+```bash
+.venv/bin/python -u main.py --follow --dry-run --model yolo11s.pt --imgsz 640
+```
+
+Click a person box. After confirmation, its current width and height become
+the reference gap. The preview requests forward input only when both box
+dimensions shrink by at least 15% for 0.4 seconds and the person is centred.
+The 0.08 cap is a normalized stick input, **not a measured speed or angle**.
+It does not guarantee gentle motion, altitude retention, or stopping distance.
+`H` cancels selection-based control and requests neutral sticks; it is not a
+position-hold controller. Uppercase and lowercase letter shortcuts work.
+`SPACE` continues to request landing.
+
+Before re-enabling live following, compare the original app's known-working
+neutral/takeoff/control packets with ours, with props removed. Verify the
+packet layout, axis order/sign, neutral values, and throttle/mode flags.
+The current program has no measured altitude, velocity, or airborne-state
+feedback. Do not guess compensating throttle or trim from detector boxes.
+
+### Manual keyboard control with tracking display
+
+`--manual` keeps person detection and click selection visible while giving
+movement control only to the keyboard. Selecting a person never enables
+autopilot. Offline target acquired/lost callouts also work in manual mode;
+they describe visual tracking, not hovering or approaching. It uses a Tk
+window (included in this Mac Python installation) to
+receive key releases and standalone modifier keys.
+
+Preview without flight commands:
+
+```bash
+.venv/bin/python -u main.py --manual --dry-run --webcam --model yolo11s.pt
+```
+
+With the drone camera, omit `--webcam`. Omitting `--dry-run` enables real
+manual commands. The reported hover/altitude-loss fault remains unresolved;
+manual input does not repair the protocol or provide position hold.
+
+| Key | Manual action |
+| --- | --- |
+| W / S | Forward / back |
+| A / D | Slide left / right |
+| Q / E | Rotate left / right (Q no longer quits) |
+| Shift / Control | Climb / descend; Up/Down arrows are alternatives |
+| T | Request takeoff, followed by a three-second neutral interval |
+| L or SPACE | Request landing |
+| K | Stop motors; the drone drops |
+| H | Cancel held movement and request neutral sticks |
+| Escape | Request landing and quit |
+| R | Start/stop HUD and clean video recordings |
+| 1 / 2 / 3 | Label the attempt steady / unstable / crash |
+
+Hold movement keys to request input; release to return that axis to neutral.
+Opposing keys cancel. Forward/sideways input is capped at 0.03, yaw/throttle
+at 0.08 (or lower configured limits). These are stick fractions, not measured
+angles or speeds. There is no guarantee of stable hover or altitude retention.
+Losing window focus clears held input; sender-side input expires after 0.2s
+without a refresh. H requires releasing held keys before movement can restart.
+Missing/stale video and control-link faults also suppress movement. Landing
+and motor-stop actions remain available without video.
+
+The footer shows held keys, the takeoff countdown, and the reason movement is
+blocked (such as window focus or stale video). After T, release all keys and
+wait for `READY: manual input enabled` before requesting movement. READY means
+software permits input; it does not confirm hover or the drone's response.
+
+The `INPUT` row shows capped pitch, roll, yaw and throttle requests; these are
+not measured movement. Video acknowledgement packets embed stick commands
+too. They now use the same current input and expiry checks as the RC sender,
+instead of interleaving neutral values with key inputs. Action flags such as
+takeoff/land are never copied into video acknowledgements. Physical response
+to this change is unverified; the stick caps have not been increased.
+
+Operator labels are stored with the attempt number in the journal. R recordings
+are linked by filename and per-frame timestamps, allowing video to be compared
+with command and outcome labels. This collects review data; it does not train
+a controller or automatically raise limits. The known WiFi-UAV status format
+mentions flight-state, battery and flags; usable attitude/gyro/altitude telemetry
+has not been verified for this F19 or wired into this program.
+
+### Flight-attempt logs
+
+Live control sessions automatically write `flight_logs/flight_<time>.jsonl`.
+The terminal prints the path. These local files are ignored by Git; no logs
+are uploaded automatically. Dry runs do not create flight-attempt logs.
+
+Each line is JSON with a UTC timestamp and elapsed session time. Events cover
+session start/end, takeoff requests and rejections, selection/tracking changes,
+H presses, landing/motor-stop requests, and local socket failures. Control
+records include the effective command, stick bytes, raw packet hex, and video
+age. Changed control/flag values are logged immediately; unchanged packets are
+sampled every 0.1 seconds. `video_ack_control` events separately record sampled
+video ACK packets and their embedded stick values while live controls run.
+`keyboard_state` records held keys and window-input blocks. `manual_input`
+records requested axes, the effective command, and any movement-block reason,
+including key requests during the takeoff hold.
+Disk writes run on a separate thread; the final row reports dropped log events.
+
+An attempt lasts from an accepted takeoff request until a land/stop request or
+cancellation, **not measured time airborne**. Attempts shorter than 30 seconds
+are labelled `suspected_failed`; longer attempts remain `unverified`. A session
+without a takeoff request is labelled `no_takeoff_requested`. A file without
+`journal_end` is incomplete, for example after a forced exit; it must not be
+counted as a successful flight. These flags help review attempts but cannot
+prove a crash, takeoff, hover, or successful landing.
+
+### Person preview and tracking details
 
 Start with the drone camera and **flight commands disabled** (Mac example):
 
@@ -353,11 +477,21 @@ hardware checks after the existing props-off procedure. On Windows use
 `.\.venv-win\Scripts\python.exe` in place of `.venv/bin/python`.
 
 - The display shows person IDs, confidence and measured detection time. Yellow
-  boxes are selectable; gray boxes are too uncertain to control flight.
-- Weak detections can preserve the same ID for up to 0.5 seconds, but command
-  neutral sticks throughout. Three strong detections are needed to resume.
-- A missing ID, overlapping people, implausible jump, appearance mismatch or
-  expired lock requires another click. No transfer to another tracking ID is allowed.
+  and amber boxes are selectable; gray boxes are too uncertain to select.
+  Clicking uses the displayed box and reports whether selection was accepted.
+  Amber selections still need three detections at 60% or higher to confirm.
+  A high-confidence box for another person does not replace your selection:
+  click that box explicitly. Stale or overlapping boxes cannot be selected.
+- `--dry-run` displays a no-flight-commands banner. It previews selection and
+  tracking; neither takeoff nor autopilot keys send flight commands.
+- Selection stays remembered when confidence drops or the person leaves view,
+  until you click a different person or close the app. The display says
+  "Target remembered" while their position is unknown; neutral sticks are sent.
+- On return, the tracker compares clothing appearance and requires three
+  consistent, confident observations before resuming, even if the tracker assigns
+  a new ID. Overlapping or similarly dressed people keep the drone hovering.
+  Appearance matching is a heuristic and can confuse similar people; it does
+  not guarantee the same person after they leave view. Click to correct a match.
 - The 0.3-second detection deadline includes local video queue age and inference.
   Slow results cannot steer. This is local receive age, not measured camera exposure age.
 - `R` saves both `run_...mp4` (HUD) and `run_..._raw.mp4` (clean frames for evaluation).

@@ -1,10 +1,7 @@
 """OWNER: Person 3 — the GTA-style lock-on overlay. This is what judges remember.
 
-Ideas to add: lock-on beep sound, pulsing reticle, distance estimate,
-"TARGET REACHED" flash, a recording indicator.
+Steady brackets and crosshair; current detection state is shown without flashing.
 """
-import time
-
 import cv2
 
 WHITE = (255, 255, 255)
@@ -33,28 +30,28 @@ def draw(frame, target, state, command, autopilot, fps=0.0):
     h, w = img.shape[:2]
     color = STATE_COLORS.get(state, WHITE)
 
-    # Center crosshair
+    # A fixed neutral crosshair avoids flashing the whole aiming area when
+    # detection confidence crosses the lock threshold.
     cx, cy = w // 2, h // 2
-    cv2.circle(img, (cx, cy), 22, color, 1)
-    cv2.line(img, (cx - 32, cy), (cx - 12, cy), color, 1)
-    cv2.line(img, (cx + 12, cy), (cx + 32, cy), color, 1)
-    cv2.line(img, (cx, cy - 32), (cx, cy - 12), color, 1)
-    cv2.line(img, (cx, cy + 12), (cx, cy + 32), color, 1)
+    cv2.circle(img, (cx, cy), 22, WHITE, 1)
+    cv2.line(img, (cx - 32, cy), (cx - 12, cy), WHITE, 1)
+    cv2.line(img, (cx + 12, cy), (cx + 32, cy), WHITE, 1)
+    cv2.line(img, (cx, cy - 32), (cx, cy - 12), WHITE, 1)
+    cv2.line(img, (cx, cy + 12), (cx, cy + 32), WHITE, 1)
 
     # Target bracket
     if target["found"]:
         tx, ty = int(target["x"] * w), int(target["y"] * h)
         bw, bh = int(target["w"] * w), int(target["h"] * h)
-        pulse = 4 if state in ("LOCKED", "APPROACHING") and int(time.time() * 4) % 2 else 0
-        _corner_box(img, tx - bw // 2 - pulse, ty - bh // 2 - pulse,
-                    tx + bw // 2 + pulse, ty + bh // 2 + pulse, color)
+        _corner_box(img, tx - bw // 2, ty - bh // 2,
+                    tx + bw // 2, ty + bh // 2, color)
         cv2.line(img, (cx, cy), (tx, ty), color, 1)
 
     # Status text
     label = {"LOCKED": "TARGET LOCKED", "APPROACHING": "LOCKED - CLOSING IN",
              "REACHED": "TARGET REACHED", "LOST": "TARGET LOST",
              "SEARCHING": "SEARCHING..."}.get(state, state)
-    cv2.putText(img, label, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
+    cv2.putText(img, label, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
     # Autopilot status + controls
     ap = "AUTOPILOT: ON" if autopilot else "AUTOPILOT: OFF"
@@ -65,10 +62,8 @@ def draw(frame, target, state, command, autopilot, fps=0.0):
 
     # Command readout
     cmd = f"yaw {command['yaw']:+.2f}  up {command['up']:+.2f}  fwd {command['forward']:+.2f}"
-    cv2.putText(img, cmd, (w - 360, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, WHITE, 1)
+    # Separate rows prevent command digits from overwriting the state label.
+    cv2.putText(img, cmd, (20, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.45, WHITE, 1)
     cv2.putText(img, f"{fps:.0f} fps", (w - 100, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, WHITE, 1)
-
-    if state == "REACHED":
-        cv2.rectangle(img, (0, 0), (w - 1, h - 1), GREEN, 6)
 
     return img

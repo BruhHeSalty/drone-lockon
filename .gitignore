@@ -4,3 +4,4 @@ __pycache__/
 .venv-win/
 run_*.mp4
 test_video.mp4
+flight_logs/
