@@ -1,20 +1,30 @@
 """OWNER: Person 2 — find the target in a frame.
 
-Color tracking for the drone; optional local YOLO person tracking for dry runs.
+Color tracking and YOLO person tracking for explicit person-control modes.
 Run `python vision.py --person` for the Mac webcam person-tracking demo.
 Must return a Target dict (see INTERFACES.md).
+
+Drone frames get color-noise and luminance cleanup before detection; webcam frames do not.
+DRONE_VISION_PREPROCESS=off disables it for comparison; =on enables it on a
+recorded drone clip. This does not restore detail lost to clipping/compression.
+Clicking a weak candidate remembers the selection, but steering still requires
+three detections at >= 0.60 confidence and a result younger than 0.3 seconds.
 """
 import time
+import threading
 
 import cv2
 import numpy as np
 
 import config
 
+# This is the finder's "I cannot see it clearly" answer.
+# x/y say where the middle is; w/h say how big it is; conf says how sure we are.
 NOT_FOUND = {"found": False, "x": 0.5, "y": 0.5, "w": 0.0, "h": 0.0, "conf": 0.0}
 
 
 class ColorTracker:
+    # Look for a patch of one color, like finding a green toy in a picture.
     CONFIRM_FRAMES = 3
     LOST_TIMEOUT_S = 1.0
     MAX_CENTER_STEP = 0.08  # fraction of frame width/height per frame
@@ -40,6 +50,7 @@ class ColorTracker:
         x0, x1 = max(px - radius, 0), min(px + radius, w)
         y0, y1 = max(py - radius, 0), min(py + radius, h)
         patch = cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
+        # Sample a small patch around the click, so one odd dot does not decide.
         self.hsv = np.median(patch.reshape(-1, 3), axis=0).astype(int)
         candidates, mask = self._candidates(frame)
         for contour, target in candidates:
@@ -50,6 +61,7 @@ class ColorTracker:
         print(f"[vision] target color set to HSV {tuple(self.hsv)}")
 
     def _mask(self, hsv_frame):
+        # Make a yes/no picture: white means the color matches, black means no.
         lo = self.hsv - self.tol
         hi = self.hsv + self.tol
         sv_lo = np.clip(lo[1:], 0, 255)
@@ -62,6 +74,7 @@ class ColorTracker:
         else:
             mask = cv2.inRange(hsv_frame, np.array([lo[0], *sv_lo]), np.array([hi[0], *sv_hi]))
         kernel = np.ones((5, 5), np.uint8)
+        # Remove little specks, then fill little holes in the matching patches.
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         return mask
@@ -78,6 +91,8 @@ class ColorTracker:
             if area / (fw * fh) < config.MIN_TARGET_AREA:
                 continue
             x, y, w, h = cv2.boundingRect(contour)
+            # Draw an imaginary box around the patch. Store fractions of the
+            # picture size, so the same rules work with big or small pictures.
             candidates.append((contour, {
                 "found": True,
                 "x": (x + w / 2) / fw,
@@ -89,6 +104,7 @@ class ColorTracker:
         return candidates, mask
 
     def _match_score(self, target):
+        # Compare this patch with the last one. Nearby, similar boxes score better.
         previous = self._previous
         # Limit displacement in both frame units and object-size units.
         dx = abs(target["x"] - previous["x"]) / min(self.MAX_CENTER_STEP, previous["w"])
@@ -130,6 +146,7 @@ class ColorTracker:
             if score is not None:
                 matches.append((score, target))
         matches.sort(key=lambda item: item[0])
+        # If two patches look equally good, say "not found" instead of guessing.
         if not matches or (len(matches) > 1 and matches[1][0] - matches[0][0] < self.AMBIGUITY_MARGIN):
             self._consistent = 0
             return dict(NOT_FOUND)
@@ -143,23 +160,42 @@ class ColorTracker:
 
 
 class PersonTracker:
-    """YOLO + ByteTrack person IDs, restricted to dry-run control.
+    """YOLO person IDs with camera-motion compensation for person control.
 
-    Remember the selected person's clothing appearance even after their track
-    ID disappears. Reacquire only an unambiguous appearance match confirmed
-    across several frames. This is an appearance heuristic, not identity proof.
+    Remember the clicked appearance plus a slowly updated recent appearance
+    through clear, uninterrupted tracking. Reacquire only an unambiguous match confirmed
+    across several fresh frames. Selection persists until another person is clicked
+    or the app closes; uncertain or missing observations always command hover.
+    This is an appearance heuristic, not identity proof.
     """
 
+    # YOLO is the picture finder. It draws boxes around people and gives scores.
+    # A track ID is a temporary number for a box, not proof of who a person is.
     CONFIRM_FRAMES = 3
     MAX_APPEARANCE_DISTANCE = 0.30
     APPEARANCE_MARGIN = 0.08
+    CONTINUITY_TIMEOUT = 0.5
+    SELECT_CONF = 0.25
+    CONTROL_CONF = 0.60
 
-    def __init__(self):
-        self._check_dry_run()
+    def __init__(self, allow_live_yaw=False, model="yolo11n.pt", device="auto",
+                 imgsz=640, tracker="botsort.yaml", preprocess="auto"):
+        if imgsz < 320 or imgsz > 1280 or imgsz % 32:
+            raise ValueError("Person image size must be a multiple of 32 between 320 and 1280")
+        if tracker not in ("botsort.yaml", "bytetrack.yaml"):
+            raise ValueError("Choose botsort.yaml or bytetrack.yaml")
+        self.allow_live_yaw = allow_live_yaw
+        self._check_control_mode()
         # Keep optional dependencies/model caches out of the color-only path.
         import os
         import sys
         from pathlib import Path
+
+        self._preprocess_mode = os.environ.get("DRONE_VISION_PREPROCESS", preprocess).lower()
+        if self._preprocess_mode not in ("auto", "on", "off"):
+            raise ValueError("DRONE_VISION_PREPROCESS must be auto, on or off")
+        self._drone_video = config.VIDEO_SOURCE == "drone"
+        self._clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
 
         cache = Path(sys.prefix) / "share" / "drone-lockon"
         cache.mkdir(parents=True, exist_ok=True)
@@ -167,52 +203,122 @@ class PersonTracker:
         os.environ.setdefault("YOLO_AUTOINSTALL", "false")
         try:
             from ultralytics import YOLO
+            import torch
             import lap  # noqa: F401 -- ByteTrack dependency; fail before opening camera
         except ImportError as exc:
             raise RuntimeError(
                 "Person mode needs local dependencies: python -m pip install ultralytics lap"
             ) from exc
-        self.model = YOLO(str(cache / "yolo11n.pt"))
+        model_path = Path(model).expanduser()
+        if not model_path.is_file():
+            if model not in ("yolo11n.pt", "yolo11s.pt", "yolo11m.pt"):
+                raise FileNotFoundError(f"Person model not found: {model}")
+            model_path = cache / model
+        self.model = YOLO(str(model_path))
+        person_classes = [key for key, name in self.model.names.items() if name == "person"]
+        if len(person_classes) != 1:
+            raise ValueError("Person model must have exactly one class named 'person'")
+        self.person_class = person_classes[0]
+        self.device = ("0" if torch.cuda.is_available() else
+                       "mps" if torch.backends.mps.is_available() else "cpu") if device == "auto" else device
+        self.imgsz = imgsz
+        self.tracker_config = tracker
         self._tracks = {}
         self._selected_id = None
-        self._require_click = False
+        self._require_click = allow_live_yaw
         self._consistent = 0
         self._pending_id = None
         self._reference = None
-        print("[vision] PERSON mode (dry run). Stand in view; click to select/reselect a person.")
+        self._recent_reference = None
+        self._previous_live = None
+        self._last_confirmed = 0.0
+        self._visible = False
+        self.status = "Click a person to select"
+        # First inference and accelerator initialization happen before flight connects.
+        self.model.predict(np.zeros((480, 640, 3), dtype=np.uint8), imgsz=imgsz,
+                           device=self.device, classes=[self.person_class], verbose=False)
+        cleanup = self._preprocess_mode == "on" or (self._preprocess_mode == "auto" and self._drone_video)
+        print(f"[vision] {model_path.name}, {tracker}, {self.device}, size {imgsz}, "
+              f"image cleanup {'ON' if cleanup else 'OFF'}. Click a person box; weak boxes wait for confirmation.")
 
-    @staticmethod
-    def _check_dry_run():
-        if config.CONTROL_PORT is not None:
-            raise RuntimeError("Person tracking requires CONTROL_PORT = None; never fly at people.")
+    def _prepare_frame(self, frame):
+        """Color denoising/contrast correction at native size, without sharpening.
+
+        Only the detector sees this copy. Original BGR pixels and coordinates
+        stay available for the HUD and appearance matching. One inference pass
+        per frame keeps the existing age deadline meaningful.
+        """
+        # Tidy noisy colors and brightness so the finder has an easier picture.
+        mode = getattr(self, "_preprocess_mode", "off")
+        if mode == "off" or (mode == "auto" and not self._drone_video):
+            return frame
+        # The drone clip has strong colored speckles and edge halos. Filtering
+        # Y alone leaves those chroma artifacts for YOLO to interpret as edges.
+        # Smooth all three channels first; keep this out of the webcam path.
+        # This is spatial filtering only: no old frames or invented detail.
+        denoised = cv2.GaussianBlur(frame, (5, 5), 1.2)
+        ycc = cv2.cvtColor(denoised, cv2.COLOR_BGR2YCrCb)
+        luminance = cv2.GaussianBlur(ycc[:, :, 0], (3, 3), 0.6)
+        low, high = np.percentile(luminance[::4, ::4], (5, 95))
+        if high - low < 16:
+            return frame  # No usable contrast: do not amplify nearly flat noise.
+        gain = min(1.6, max(1.0, 220.0 / (high - low)))
+        stretched = np.clip((luminance.astype(np.float32) - low) * gain + 16, 0, 255).astype(np.uint8)
+        local = self._clahe.apply(luminance)
+        ycc[:, :, 0] = cv2.addWeighted(stretched, 0.7, local, 0.3, 0)
+        return cv2.cvtColor(ycc, cv2.COLOR_YCrCb2BGR)
+
+    def _check_control_mode(self):
+        if config.CONTROL_PORT is not None and not self.allow_live_yaw:
+            raise RuntimeError("Live person tracking requires an explicit person-control mode.")
 
     def set_color_from_pixel(self, frame, px, py, radius=5):
         """Keep the existing click interface, but select a person ID, not color."""
-        self._check_dry_run()
+        self._check_control_mode()
         h, w = frame.shape[:2]
         if not (0 <= px < w and 0 <= py < h):
             return
         x, y = px / w, py / h
         matches = [track_id for track_id, target in self._tracks.items()
-                   if abs(x - target["x"]) <= target["w"] / 2
+                   if target["conf"] >= self.SELECT_CONF
+                   and abs(x - target["x"]) <= target["w"] / 2
                    and abs(y - target["y"]) <= target["h"] / 2]
         if len(matches) != 1:
             print("[vision] Click inside one visible person; keeping the previous selection.")
             return
-        self._selected_id = matches[0]
-        self._reference = self._appearance(frame, self._tracks[self._selected_id])
+        track_id = matches[0]
+        self.select_track(track_id, self._tracks[track_id], self._appearance(frame, self._tracks[track_id]))
+
+    def select_track(self, track_id, target, appearance):
+        """Select from a displayed detection snapshot, without replaying old frames."""
+        # Remember the clicked person's look, then wait for more clear pictures.
+        if appearance is None:
+            self.status = "Selection has no usable appearance - click another clear box"
+            return
+        self._selected_id = track_id
+        self._reference = appearance
+        self._recent_reference = appearance.copy()
         self._require_click = True
         self._consistent = 0
-        self._pending_id = None
+        self._pending_id = track_id
+        self._previous_live = dict(target)
+        self._last_confirmed = time.monotonic()
+        self._visible = True  # The click anchors continuity; output still needs confirmation.
+        self.status = "Confirming selected person"
         print(f"[vision] selected person track {self._selected_id}; appearance remembered")
 
     @staticmethod
     def _appearance(frame, target):
-        """Coarse clothing-color signature, independent of crop resolution.
+        """Clothing color plus exposure-normalized greyscale body layout.
 
         Trim box edges to reduce background; retain upper/lower color layout.
-        Low-saturation pixels use brightness bins instead of unstable hue.
+        Washout reduces hue's weight continuously; relative luminance and coarse
+        spatial structure stay useful without relying on saturated clothing.
+        Neighboring histogram bins share weight so small lighting/color shifts
+        do not look like an entirely different outfit.
         """
+        # Make a tiny color-and-shape summary, like notes about an outfit.
+        # Similar notes help us match boxes, but cannot prove it is the same person.
         height, width = frame.shape[:2]
         x1 = max(0, int((target["x"] - target["w"] * 0.35) * width))
         x2 = min(width, int((target["x"] + target["w"] * 0.35) * width))
@@ -220,39 +326,104 @@ class PersonTracker:
         y2 = min(height, int((target["y"] + target["h"] * 0.40) * height))
         if x2 <= x1 or y2 <= y1:
             return None
-        crop = cv2.resize(frame[y1:y2, x1:x2], (48, 96))
+        crop = cv2.resize(frame[y1:y2, x1:x2], (48, 96), interpolation=cv2.INTER_AREA)
+        crop = cv2.GaussianBlur(crop, (3, 3), 0.6)
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        low, high = np.percentile(gray, (5, 95))
+        relative = np.clip((gray - low) / max(high - low, 24.0), 0, 1)
+        normalized = np.round(relative * 255).astype(np.uint8)
         features = []
-        for region, weight in ((hsv, 0.5), (hsv[:48], 0.25), (hsv[48:], 0.25)):
-            colored = ((region[:, :, 1] >= 40) & (region[:, :, 2] >= 30)).astype(np.uint8)
+        for rows, weight in ((slice(None), 0.5), (slice(0, 48), 0.25), (slice(48, None), 0.25)):
+            region = hsv[rows]
+            colored = (region[:, :, 1] >= 40).astype(np.uint8)
             color_hist = cv2.calcHist([region], [0, 1], colored, [18, 4], [0, 180, 0, 256])
-            gray_hist = cv2.calcHist([region], [2], 1 - colored, [8], [0, 256])
-            hist = np.concatenate((color_hist.ravel(), gray_hist.ravel()))
-            features.append(np.sqrt(weight * hist / max(float(hist.sum()), 1.0)))
+            # Indoor exposure/color noise can move pixels across a bin edge.
+            # Keep saturation information; hue alone confuses similar outfits.
+            # Hue wraps around red, while saturation and brightness do not.
+            color_hist = (.5 * color_hist + .25 * np.roll(color_hist, 1, axis=0)
+                          + .25 * np.roll(color_hist, -1, axis=0))
+            padded = np.pad(color_hist, ((0, 0), (1, 1)), mode='edge')
+            color_hist = .5 * padded[:, 1:-1] + .25 * (padded[:, :-2] + padded[:, 2:])
+            gray_hist = cv2.calcHist([normalized[rows]], [0], None, [8], [0, 256])
+            padded_gray = np.pad(gray_hist.ravel(), (1, 1), mode='edge')
+            gray_hist = .5 * padded_gray[1:-1] + .25 * (padded_gray[:-2] + padded_gray[2:])
+            color_weight = 0.6 * min(float(region[:, :, 1].mean()) / 80.0, 1.0)
+            if not color_hist.any():
+                color_weight = 0.0
+            color_hist = color_weight * color_hist.ravel() / max(float(color_hist.sum()), 1.0)
+            gray_hist = (1 - color_weight) * gray_hist.ravel() / max(float(gray_hist.sum()), 1.0)
+            features.append(np.sqrt(0.7 * weight * np.concatenate((color_hist, gray_hist))))
+        layout = cv2.resize(relative, (6, 12), interpolation=cv2.INTER_AREA).ravel()
+        features.append(np.sqrt(0.3) * layout / max(float(np.linalg.norm(layout)), 1e-6))
         return np.concatenate(features)
 
+    def _overlapping(self, track_id):
+        candidate = self._tracks[track_id]
+        for other_id, other in self._tracks.items():
+            if other_id == track_id or other["conf"] < .25:
+                continue
+            overlap_x = max(0., min(candidate["x"] + candidate["w"] / 2, other["x"] + other["w"] / 2)
+                            - max(candidate["x"] - candidate["w"] / 2, other["x"] - other["w"] / 2))
+            overlap_y = max(0., min(candidate["y"] + candidate["h"] / 2, other["y"] + other["h"] / 2)
+                            - max(candidate["y"] - candidate["h"] / 2, other["y"] - other["h"] / 2))
+            if overlap_x * overlap_y / min(candidate["w"] * candidate["h"], other["w"] * other["h"]) > .2:
+                return True
+        return False
+
     def _choose_match(self, frame):
+        # Compare visible people with the remembered look. Unsure means wait.
         if self._reference is None:
+            return None
+        current = self._tracks.get(self._selected_id)
+        if current is not None and current["conf"] < self.CONTROL_CONF:
+            self._failure_reason = "Target remembered - low confidence, holding"
             return None
         matches = []
         for track_id, target in self._tracks.items():
             appearance = self._appearance(frame, target)
             if appearance is not None:
-                distance = float(np.linalg.norm(appearance - self._reference) / np.sqrt(2))
+                # Keep the click as an anchor, but also recognize gradual pose,
+                # exposure and partial-body changes observed while locked.
+                references = [self._reference]
+                recent = getattr(self, "_recent_reference", None)
+                if recent is not None:
+                    references.append(recent)
+                distance = min(float(np.linalg.norm(appearance - reference) / np.sqrt(2))
+                               for reference in references)
                 matches.append((distance, track_id))
         matches.sort()
+        # During uninterrupted tracking, retain the existing ID even when another
+        # person elsewhere wears similar clothes. After loss, compare everyone.
+        if self._visible and current is not None:
+            selected = next((distance for distance, track_id in matches if track_id == self._selected_id), None)
+            if selected is not None and selected <= self.MAX_APPEARANCE_DISTANCE:
+                if self._overlapping(self._selected_id):
+                    self._failure_reason = "Target remembered - people overlap, holding"
+                    return None
+                return self._selected_id
         if not matches or matches[0][0] > self.MAX_APPEARANCE_DISTANCE:
+            self._failure_reason = ("Appearance differs - click a box to select it" if matches
+                                    else "Target remembered - waiting for a clear match")
             return None
         if len(matches) > 1 and matches[1][0] - matches[0][0] < self.APPEARANCE_MARGIN:
+            self._failure_reason = "Target remembered - similar people, holding"
             return None
-        return matches[0][1]
+        best_id = matches[0][1]
+        if self._tracks[best_id]["conf"] < self.CONTROL_CONF or self._overlapping(best_id):
+            self._failure_reason = "Target remembered - uncertain match, holding"
+            return None
+        return best_id
 
     def find(self, frame):
-        self._check_dry_run()
+        self._check_control_mode()
+        self._failure_reason = "Target remembered - out of view, holding"
         # Use a persistent tracker to associate people across frames and scale changes.
+        detector_frame = self._prepare_frame(frame)
         result = self.model.track(
-            frame, persist=True, tracker="bytetrack.yaml", classes=[0],
-            conf=0.35, imgsz=640, device="cpu", verbose=False,
+            detector_frame, persist=True, tracker=self.tracker_config, classes=[self.person_class],
+            # Weak detections help association; flight still requires >= 0.6.
+            conf=0.1, imgsz=self.imgsz, device=self.device, verbose=False,
         )[0]
         self._tracks = {}
         boxes = result.boxes
@@ -264,7 +435,9 @@ class PersonTracker:
                 x1, y1, x2, y2 = coords
                 x1, x2 = np.clip([x1, x2], 0, width)
                 y1, y2 = np.clip([y1, y2], 0, height)
-                if x2 <= x1 or y2 <= y1 or confidence < 0.45:
+                if not np.isfinite([x1, y1, x2, y2, confidence]).all():
+                    continue
+                if x2 <= x1 or y2 <= y1 or confidence < 0.1:
                     continue
                 self._tracks[int(track_id)] = {
                     "found": True, "x": float((x1 + x2) / (2 * width)),
@@ -277,21 +450,281 @@ class PersonTracker:
             self._selected_id = next(iter(self._tracks))
             self._reference = self._appearance(frame, self._tracks[self._selected_id])
 
-        match_id = self._choose_match(frame)
-        if match_id is None:
+        if time.monotonic() - self._last_confirmed > self.CONTINUITY_TIMEOUT:
+            # A gap expires motion continuity, never the user's selection.
+            self._visible = False
             self._consistent = 0
             self._pending_id = None
+            self._previous_live = None
+
+        match_id = self._choose_match(frame)
+        if match_id is not None:
+            candidate = self._tracks.get(match_id)
+            previous = self._previous_live if self._pending_id == match_id else None
+            jumped = candidate is not None and previous is not None and (
+                abs(candidate["x"] - previous["x"]) > 0.10
+                or abs(candidate["y"] - previous["y"]) > 0.10
+                or any(max(candidate[k], previous[k]) / min(candidate[k], previous[k]) > 1.5
+                       for k in ("w", "h"))
+            )
+            if candidate is None or candidate["conf"] < self.CONTROL_CONF or jumped:
+                if jumped:
+                    self._failure_reason = "Target remembered - confirming new position"
+                match_id = None
+            else:
+                self._previous_live = dict(candidate)
+                self._last_confirmed = time.monotonic()
+        if match_id is None:
+            if self._reference is not None:
+                self.status = self._failure_reason
+            elif any(t["conf"] >= self.SELECT_CONF for t in self._tracks.values()):
+                self.status = "Click a person box - weak boxes wait for confidence"
+            else:
+                self.status = "No selectable person detection - waiting"
+            self._consistent = 0
+            self._pending_id = None
+            self._previous_live = None
+            self._visible = False
             return dict(NOT_FOUND)
         if match_id != self._pending_id:
             self._pending_id = match_id
             self._consistent = 0
         self._consistent += 1
         if self._consistent < self.CONFIRM_FRAMES:
+            self.status = f"Confirming selected person {self._consistent}/{self.CONFIRM_FRAMES}"
+            # One lucky guess is not enough: wait for three clear matches in a row.
             return dict(NOT_FOUND)
         if match_id != self._selected_id:
             print(f"[vision] Reacquired selected appearance as person track {match_id}")
+        # Learn only after all existing match/position/confirmation gates pass,
+        # on the same uninterrupted ID with one clear, strong person. Freeze
+        # through loss, weak detections, ambiguity and the first reacquisition.
+        # Never overwrite the original click appearance.
+        if (self._visible and match_id == self._selected_id
+                and self._tracks[match_id]["conf"] >= .8
+                and sum(t["conf"] >= self.SELECT_CONF for t in self._tracks.values()) == 1):
+            appearance = self._appearance(frame, self._tracks[match_id])
+            if appearance is not None:
+                recent = getattr(self, "_recent_reference", None)
+                if recent is None:
+                    recent = self._reference
+                self._recent_reference = .9 * recent + .1 * appearance
         self._selected_id = match_id
+        self._visible = True
+        self.status = "Selected person confirmed"
         return dict(self._tracks[match_id])
+
+
+class AsyncPersonTracker:
+    """One latest-frame worker; stale detections never become flight commands."""
+    # A background helper finds people while the main loop keeps checking keys.
+    # It uses the newest waiting picture instead of building a long waiting line.
+
+    MAX_AGE = 0.3
+
+    def __init__(self, tracker):
+        self.tracker = tracker
+        self._condition = threading.Condition()
+        self._pending = None
+        self._click = None
+        self._generation = 0
+        self._result = (0.0, dict(NOT_FOUND))
+        self._snapshot = (None, {}, "Waiting for detection")
+        self._displayed = None
+        self._visual_tracks = {}
+        self._visual_generation = 0
+        self._selected_id = None
+        self._last_submit = float("-inf")
+        self._inference_ms = 0.0
+        self._click_notice = ""
+        self._click_notice_until = 0.0
+        self._closed = False
+        self._error = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def set_color_from_pixel(self, frame, x, y):
+        """Return True only when this click accepts one fresh person box."""
+        with self._condition:
+            # The worker may already have moved on since draw_candidates().
+            # Select the box the user actually saw, with its original timestamp.
+            displayed = self._displayed
+            if displayed is None:
+                self._click_notice = "Click ignored: no fresh detection shown"
+                self._click_notice_until = time.monotonic() + 2.0
+                return
+            stamp, (detected_frame, tracks, _), generation = displayed
+            if (detected_frame is None or generation != self._generation
+                    or not 0 <= time.monotonic() - stamp < self.MAX_AGE):
+                self._click_notice = "Click ignored: no fresh detection yet"
+                self._click_notice_until = time.monotonic() + 2.0
+                return
+            h, w = frame.shape[:2]
+            matches = [(track_id, t) for track_id, t in tracks.items()
+                       if t["conf"] >= PersonTracker.SELECT_CONF and abs(x / w - t["x"]) <= t["w"] / 2
+                       and abs(y / h - t["y"]) <= t["h"] / 2]
+            if len(matches) != 1:
+                self._click_notice = "Click inside one person box" if not matches else "Click ambiguous: boxes overlap"
+                self._click_notice_until = time.monotonic() + 2.0
+                return
+            track_id, target = matches[0]
+            appearance = self.tracker._appearance(detected_frame, target)
+            if appearance is None:
+                self._click_notice = "Click ignored: person crop is empty"
+                self._click_notice_until = time.monotonic() + 2.0
+                return
+            self._click_notice = f"Selected person {track_id} - waiting for 3 clear frames"
+            self._click_notice_until = time.monotonic() + 2.0
+            self._click = (track_id, dict(target), appearance)
+            self._generation += 1
+            self._displayed = None
+            self._selected_id = track_id
+            self._result = (0.0, dict(NOT_FOUND))
+            if self._pending is not None:
+                stamp, pending_frame, _ = self._pending
+                self._pending = (stamp, pending_frame, self._generation)
+            return True
+
+    def find(self, frame, frame_time=None):
+        # Hand the helper a picture and get its latest answer without waiting.
+        now = time.monotonic()
+        stamp = now if frame_time is None else frame_time
+        with self._condition:
+            if self._error is not None:
+                raise RuntimeError("Person detection failed") from self._error
+            if not 0 <= now - stamp < self.MAX_AGE:
+                return dict(NOT_FOUND)
+            if stamp > self._last_submit:
+                self._last_submit = stamp
+                self._pending = (stamp, frame.copy(), self._generation)
+                self._condition.notify()
+            stamp, target = self._result
+            # An old answer is no longer safe to steer with: report "not found".
+            return dict(target if 0 <= now - stamp < self.MAX_AGE else NOT_FOUND)
+
+    def distance_observation(self, video_fresh=True):
+        """Return a matched frame/target snapshot for display-only pose analysis.
+
+        Do not pair an asynchronous detection with a newer camera image. This
+        also remembers exactly which boxes the distance screen makes selectable.
+        """
+        with self._condition:
+            stamp, target = self._result
+            frame, tracks, status = self._snapshot
+            fresh = video_fresh and frame is not None and 0 <= time.monotonic() - stamp < self.MAX_AGE
+            self._displayed = (stamp, self._snapshot, self._generation) if fresh else None
+            if not fresh:
+                return None
+            return dict(frame=frame, target=dict(target), tracks={i: dict(t) for i, t in tracks.items()},
+                        status=status, source_frame_time=stamp, generation=self._generation)
+
+    def draw_candidates(self, view, video_fresh=True):
+        """Briefly retain visual boxes; stale boxes never become selectable."""
+        now = time.monotonic()
+        with self._condition:
+            stamp, _ = self._result
+            _, tracks, status = self._snapshot
+            selected_id = self._selected_id
+            click_notice = self._click_notice if now < self._click_notice_until else ""
+            age = now - stamp
+            fresh = video_fresh and 0 <= age < self.MAX_AGE
+            self._displayed = (stamp, self._snapshot, self._generation) if fresh else None
+            if self._visual_generation != self._generation:
+                self._visual_tracks.clear()
+                self._visual_generation = self._generation
+            if fresh:
+                for track_id, target in tracks.items():
+                    self._visual_tracks[track_id] = (stamp, dict(target))
+            self._visual_tracks = {i: entry for i, entry in self._visual_tracks.items()
+                                   if 0 <= now - entry[0] < 0.65}
+            visual_tracks = dict(self._visual_tracks)
+        if visual_tracks:
+            h, w = view.shape[:2]
+            for track_id, (seen, target) in visual_tracks.items():
+                x1, y1 = int((target["x"] - target["w"] / 2) * w), int((target["y"] - target["h"] / 2) * h)
+                x2, y2 = int((target["x"] + target["w"] / 2) * w), int((target["y"] + target["h"] / 2) * h)
+                selectable = target["conf"] >= PersonTracker.SELECT_CONF
+                strong = target["conf"] >= PersonTracker.CONTROL_CONF
+                color = (0, 220, 220) if strong else (0, 165, 255) if selectable else (130, 130, 130)
+                label = "person" if strong else "candidate" if selectable else "weak"
+                if track_id == selected_id:
+                    label = "SELECTED"
+                    color = (0, 220, 0) if strong else (0, 165, 255)
+                # Keep geometry steady through short gaps, then fade to the
+                # underlying video. No visual cache is used by find() or clicks.
+                stale = not fresh or track_id not in tracks
+                opacity = max(0.0, min(1.0, (0.65 - (now - seen)) / 0.25))
+                suffix = 'last seen' if stale else f"{target['conf']:.0%}"
+                text = f"{label} {track_id} {suffix}"
+                text_width = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, .4, 1)[0][0]
+                label_x = max(4, min(x1, w - text_width - 4))
+                label_y = min(h - 96, max(155, y1 - 5))
+                # Blend only this box's pixels, not a full-screen copy per person.
+                rx0, ry0 = max(0, min(x1, label_x) - 3), max(0, min(y1, label_y - 15) - 3)
+                rx1, ry1 = min(w, max(x2, label_x + text_width) + 3), min(h, max(y2, label_y + 5) + 3)
+                region = view[ry0:ry1, rx0:rx1]
+                before = region.copy() if opacity < 1 and region.size else None
+                if track_id != selected_id:
+                    cv2.rectangle(view, (x1, y1), (x2, y2), color, 1, cv2.LINE_AA)
+                cv2.putText(view, text, (label_x, label_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, .4, color, 1, cv2.LINE_AA)
+                if before is not None:
+                    cv2.addWeighted(region, opacity, before, 1 - opacity, 0, dst=region)
+        if not fresh and age >= 0.4:
+            status = "Target remembered - video delayed, holding" if selected_id is not None else "Detection delayed - holding"
+        detail = click_notice or "Click a fresh box to select | SPACE land"
+        if selected_id is not None:
+            status = f"Selection {selected_id}: {status}"
+        # Drone frames can be only 320 pixels wide; do not clip the reason a
+        # target cannot be selected or confirmed off the right edge.
+        font, scale = cv2.FONT_HERSHEY_SIMPLEX, .4
+        lines = []
+        for message in (status, detail):
+            line = ""
+            for word in message.split():
+                joined = f"{line} {word}".strip()
+                if line and cv2.getTextSize(joined, font, scale, 1)[0][0] > view.shape[1] - 20:
+                    lines.append(line)
+                    line = word
+                else:
+                    line = joined
+            lines.append(line)
+        for y, line in zip(range(110, view.shape[0] - 5, 16), lines):
+            cv2.putText(view, line, (10, y), font, scale, (0, 220, 220), 1)
+
+    def _run(self):
+        while True:
+            with self._condition:
+                self._condition.wait_for(lambda: self._closed or self._pending is not None)
+                if self._closed:
+                    return
+                stamp, frame, generation = self._pending
+                click, self._click = self._click, None
+                self._pending = None
+            try:
+                started = time.monotonic()
+                if click is not None:
+                    self.tracker.select_track(*click)
+                target = self.tracker.find(frame)
+                with self._condition:
+                    if generation == self._generation:
+                        # A new click changes this number. Ignore work for an old click.
+                        self._result = (stamp, target)
+                        self._snapshot = (frame, dict(self.tracker._tracks), self.tracker.status)
+                        self._selected_id = self.tracker._selected_id
+                        self._inference_ms = (time.monotonic() - started) * 1000
+            except Exception as exc:
+                with self._condition:
+                    self._error = exc
+                    self._result = (0.0, dict(NOT_FOUND))
+                return
+
+    def close(self):
+        with self._condition:
+            self._closed = True
+            self._pending = None
+            self._condition.notify()
+        self._thread.join(timeout=0.5)
 
 
 def _person_webcam_demo():

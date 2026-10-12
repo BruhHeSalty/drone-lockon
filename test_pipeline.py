@@ -11,6 +11,7 @@ from vision import ColorTracker
 
 
 def fake_frame(cx, cy, size, w=640, h=480):
+    # Make a pretend camera picture: a green square on a dark background.
     img = np.full((h, w, 3), 40, np.uint8)
     half = size // 2
     cv2.rectangle(img, (cx - half, cy - half), (cx + half, cy + half), (0, 255, 0), -1)
@@ -18,6 +19,8 @@ def fake_frame(cx, cy, size, w=640, h=480):
 
 
 def main():
+    # Give the finder pretend pictures and check the decision maker's answers.
+    # An assert means "this must be true"; a wrong answer stops the test.
     tracker = ColorTracker(hsv=(60, 255, 255))
     ctrl = Controller()
 

@@ -1,0 +1,116 @@
+{
+  "reference": "calibration_data/20261012165212471.json",
+  "method": "Recalculate existing torso measurements with 19ft measured reference; no detector rerun, no missing measurements filled, no transfer to nearly downward-facing clip.",
+  "changes_to_runtime": "none; experiment only; current flight stop rules and older source evaluations unchanged",
+  "clips": [
+    {
+      "video": "20261011164938939.MOV",
+      "sampled_frames": 108,
+      "source_total_frames": 540,
+      "stride": 5,
+      "prior_torso_estimates": 0,
+      "transferred_trials": 0,
+      "validated_distances": 0,
+      "scale_change_percent": 17.59395724829238,
+      "status": "same camera reported, changed angle; no measured-distance validation for this clip"
+    },
+    {
+      "video": "20261011165024895.MOV",
+      "sampled_frames": 434,
+      "source_total_frames": 2169,
+      "stride": 5,
+      "prior_torso_estimates": 184,
+      "transferred_trials": 184,
+      "validated_distances": 0,
+      "scale_change_percent": 17.59395724829238,
+      "status": "same camera reported, changed angle; no measured-distance validation for this clip"
+    },
+    {
+      "video": "20261011165245073.MOV",
+      "sampled_frames": 418,
+      "source_total_frames": 2087,
+      "stride": 5,
+      "prior_torso_estimates": 79,
+      "transferred_trials": 0,
+      "validated_distances": 0,
+      "scale_change_percent": null,
+      "status": "transfer excluded: nearly downward-facing camera"
+    },
+    {
+      "video": "20261011182901040.MOV",
+      "sampled_frames": 485,
+      "source_total_frames": 2421,
+      "stride": 5,
+      "prior_torso_estimates": 93,
+      "transferred_trials": 93,
+      "validated_distances": 0,
+      "scale_change_percent": 17.59395724829238,
+      "status": "same camera reported, changed angle; no measured-distance validation for this clip"
+    },
+    {
+      "video": "20261011222411553.MOV",
+      "sampled_frames": 692,
+      "source_total_frames": 692,
+      "stride": 1,
+      "prior_torso_estimates": 435,
+      "transferred_trials": 435,
+      "scale_change_percent": 17.59395724829238,
+      "status": "Opening 0-5s checked against later user-reported 14ft iPhone measurement; remaining distances unverified; calibration not refitted",
+      "examples": [
+        {
+          "interval_seconds": [
+            0,
+            5
+          ],
+          "old_median_feet": 12.000006939864985,
+          "trial_median_feet": 14.11128303065695
+        },
+        {
+          "interval_seconds": [
+            15.5,
+            16.5
+          ],
+          "old_median_feet": 6.930603166490577,
+          "trial_median_feet": 8.149970524651728
+        },
+        {
+          "interval_seconds": [
+            20,
+            25
+          ],
+          "old_median_feet": null,
+          "trial_median_feet": null
+        }
+      ],
+      "measured_reference_stations": 1,
+      "measured_reference_check": {
+        "video": "20261011222411553.MOV",
+        "interval_seconds": [
+          0,
+          5
+        ],
+        "location": "opening position by the door",
+        "user_reported_distance_feet": 14,
+        "distance_method": "iPhone Measure; user measured afterwards",
+        "supersedes": {
+          "distance_feet": 12,
+          "kind": "earlier user estimate"
+        },
+        "calibration_role": "held-out check; no refitting",
+        "calibration_reference": "calibration_data/20261012165212471.json",
+        "frames": 125,
+        "estimated_frames": 122,
+        "old_median_feet": 12.000006939864985,
+        "new_median_feet": 14.11128303065695,
+        "median_estimate_absolute_difference_feet": 0.11128303065694922,
+        "mean_absolute_difference_feet": 0.3966832513047525,
+        "new_estimate_feet_p10_median_p90": [
+          13.630322198478332,
+          14.11128303065695,
+          14.836293445070172
+        ],
+        "note": "One measured station in a separate recording. Phone reading is user-reported, not independently surveyed ground truth. Correlated video frames do not count as separate distance trials; no claim about the close-up or other angles."
+      }
+    }
+  ]
+}

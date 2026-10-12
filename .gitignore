@@ -4,3 +4,21 @@ __pycache__/
 .venv-win/
 run_*.mp4
 test_video.mp4
+flight_logs/
+distance_recordings/
+
+# Keep personal camera footage, screenshots, audio and session journals local.
+*.[mM][pP]4
+*.[mM][oO][vV]
+*.[aA][vV][iI]
+*.[mM][kK][vV]
+*.[wW][eE][bB][mM]
+*.[mM]4[vV]
+*.[jJ][pP][gG]
+*.[jJ][pP][eE][gG]
+*.[pP][nN][gG]
+*.[hH][eE][iI][cC]
+*.[wW][aA][vV]
+*.[mM][pP]3
+*.[mM]4[aA]
+*.jsonl
