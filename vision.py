@@ -152,8 +152,8 @@ class ColorTracker:
 class PersonTracker:
     """YOLO person IDs with camera-motion compensation for person control.
 
-    Remember the selected person's clothing appearance even after their track
-    ID disappears. Reacquire only an unambiguous appearance match confirmed
+    Remember the clicked appearance plus a slowly updated recent appearance
+    through clear, uninterrupted tracking. Reacquire only an unambiguous match confirmed
     across several fresh frames. Selection persists until another person is clicked
     or the app closes; uncertain or missing observations always command hover.
     This is an appearance heuristic, not identity proof.
@@ -217,6 +217,7 @@ class PersonTracker:
         self._consistent = 0
         self._pending_id = None
         self._reference = None
+        self._recent_reference = None
         self._previous_live = None
         self._last_confirmed = 0.0
         self._visible = False
@@ -282,6 +283,7 @@ class PersonTracker:
             return
         self._selected_id = track_id
         self._reference = appearance
+        self._recent_reference = appearance.copy()
         self._require_click = True
         self._consistent = 0
         self._pending_id = track_id
@@ -298,6 +300,8 @@ class PersonTracker:
         Trim box edges to reduce background; retain upper/lower color layout.
         Washout reduces hue's weight continuously; relative luminance and coarse
         spatial structure stay useful without relying on saturated clothing.
+        Neighboring histogram bins share weight so small lighting/color shifts
+        do not look like an entirely different outfit.
         """
         height, width = frame.shape[:2]
         x1 = max(0, int((target["x"] - target["w"] * 0.35) * width))
@@ -318,7 +322,16 @@ class PersonTracker:
             region = hsv[rows]
             colored = (region[:, :, 1] >= 40).astype(np.uint8)
             color_hist = cv2.calcHist([region], [0, 1], colored, [18, 4], [0, 180, 0, 256])
+            # Indoor exposure/color noise can move pixels across a bin edge.
+            # Keep saturation information; hue alone confuses similar outfits.
+            # Hue wraps around red, while saturation and brightness do not.
+            color_hist = (.5 * color_hist + .25 * np.roll(color_hist, 1, axis=0)
+                          + .25 * np.roll(color_hist, -1, axis=0))
+            padded = np.pad(color_hist, ((0, 0), (1, 1)), mode='edge')
+            color_hist = .5 * padded[:, 1:-1] + .25 * (padded[:, :-2] + padded[:, 2:])
             gray_hist = cv2.calcHist([normalized[rows]], [0], None, [8], [0, 256])
+            padded_gray = np.pad(gray_hist.ravel(), (1, 1), mode='edge')
+            gray_hist = .5 * padded_gray[1:-1] + .25 * (padded_gray[:-2] + padded_gray[2:])
             color_weight = 0.6 * min(float(region[:, :, 1].mean()) / 80.0, 1.0)
             if not color_hist.any():
                 color_weight = 0.0
@@ -353,7 +366,14 @@ class PersonTracker:
         for track_id, target in self._tracks.items():
             appearance = self._appearance(frame, target)
             if appearance is not None:
-                distance = float(np.linalg.norm(appearance - self._reference) / np.sqrt(2))
+                # Keep the click as an anchor, but also recognize gradual pose,
+                # exposure and partial-body changes observed while locked.
+                references = [self._reference]
+                recent = getattr(self, "_recent_reference", None)
+                if recent is not None:
+                    references.append(recent)
+                distance = min(float(np.linalg.norm(appearance - reference) / np.sqrt(2))
+                               for reference in references)
                 matches.append((distance, track_id))
         matches.sort()
         # During uninterrupted tracking, retain the existing ID even when another
@@ -458,6 +478,19 @@ class PersonTracker:
             return dict(NOT_FOUND)
         if match_id != self._selected_id:
             print(f"[vision] Reacquired selected appearance as person track {match_id}")
+        # Learn only after all existing match/position/confirmation gates pass,
+        # on the same uninterrupted ID with one clear, strong person. Freeze
+        # through loss, weak detections, ambiguity and the first reacquisition.
+        # Never overwrite the original click appearance.
+        if (self._visible and match_id == self._selected_id
+                and self._tracks[match_id]["conf"] >= .8
+                and sum(t["conf"] >= self.SELECT_CONF for t in self._tracks.values()) == 1):
+            appearance = self._appearance(frame, self._tracks[match_id])
+            if appearance is not None:
+                recent = getattr(self, "_recent_reference", None)
+                if recent is None:
+                    recent = self._reference
+                self._recent_reference = .9 * recent + .1 * appearance
         self._selected_id = match_id
         self._visible = True
         self.status = "Selected person confirmed"
@@ -478,6 +511,8 @@ class AsyncPersonTracker:
         self._result = (0.0, dict(NOT_FOUND))
         self._snapshot = (None, {}, "Waiting for detection")
         self._displayed = None
+        self._visual_tracks = {}
+        self._visual_generation = 0
         self._selected_id = None
         self._last_submit = float("-inf")
         self._inference_ms = 0.0
@@ -546,19 +581,28 @@ class AsyncPersonTracker:
             return dict(target if 0 <= now - stamp < self.MAX_AGE else NOT_FOUND)
 
     def draw_candidates(self, view, video_fresh=True):
-        """Show selectable detections and measured delay without changing Target."""
+        """Briefly retain visual boxes; stale boxes never become selectable."""
+        now = time.monotonic()
         with self._condition:
             stamp, _ = self._result
             _, tracks, status = self._snapshot
             selected_id = self._selected_id
-            inference_ms = self._inference_ms
-            click_notice = self._click_notice if time.monotonic() < self._click_notice_until else ""
-            age = time.monotonic() - stamp
+            click_notice = self._click_notice if now < self._click_notice_until else ""
+            age = now - stamp
             fresh = video_fresh and 0 <= age < self.MAX_AGE
             self._displayed = (stamp, self._snapshot, self._generation) if fresh else None
-        if fresh:
+            if self._visual_generation != self._generation:
+                self._visual_tracks.clear()
+                self._visual_generation = self._generation
+            if fresh:
+                for track_id, target in tracks.items():
+                    self._visual_tracks[track_id] = (stamp, dict(target))
+            self._visual_tracks = {i: entry for i, entry in self._visual_tracks.items()
+                                   if 0 <= now - entry[0] < 0.65}
+            visual_tracks = dict(self._visual_tracks)
+        if visual_tracks:
             h, w = view.shape[:2]
-            for track_id, target in tracks.items():
+            for track_id, (seen, target) in visual_tracks.items():
                 x1, y1 = int((target["x"] - target["w"] / 2) * w), int((target["y"] - target["h"] / 2) * h)
                 x2, y2 = int((target["x"] + target["w"] / 2) * w), int((target["y"] + target["h"] / 2) * h)
                 selectable = target["conf"] >= PersonTracker.SELECT_CONF
@@ -568,20 +612,36 @@ class AsyncPersonTracker:
                 if track_id == selected_id:
                     label = "SELECTED"
                     color = (0, 220, 0) if strong else (0, 165, 255)
-                cv2.rectangle(view, (x1, y1), (x2, y2), color, 1)
-                cv2.putText(view, f"{label} {track_id} {target['conf']:.0%}", (x1, max(15, y1 - 5)),
-                            cv2.FONT_HERSHEY_SIMPLEX, .45, color, 1)
-        else:
+                # Keep geometry steady through short gaps, then fade to the
+                # underlying video. No visual cache is used by find() or clicks.
+                stale = not fresh or track_id not in tracks
+                opacity = max(0.0, min(1.0, (0.65 - (now - seen)) / 0.25))
+                suffix = 'last seen' if stale else f"{target['conf']:.0%}"
+                text = f"{label} {track_id} {suffix}"
+                text_width = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, .4, 1)[0][0]
+                label_x = max(4, min(x1, w - text_width - 4))
+                label_y = min(h - 96, max(155, y1 - 5))
+                # Blend only this box's pixels, not a full-screen copy per person.
+                rx0, ry0 = max(0, min(x1, label_x) - 3), max(0, min(y1, label_y - 15) - 3)
+                rx1, ry1 = min(w, max(x2, label_x + text_width) + 3), min(h, max(y2, label_y + 5) + 3)
+                region = view[ry0:ry1, rx0:rx1]
+                before = region.copy() if opacity < 1 and region.size else None
+                if track_id != selected_id:
+                    cv2.rectangle(view, (x1, y1), (x2, y2), color, 1, cv2.LINE_AA)
+                cv2.putText(view, text, (label_x, label_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, .4, color, 1, cv2.LINE_AA)
+                if before is not None:
+                    cv2.addWeighted(region, opacity, before, 1 - opacity, 0, dst=region)
+        if not fresh and age >= 0.4:
             status = "Target remembered - video delayed, holding" if selected_id is not None else "Detection delayed - holding"
-        best = max((t["conf"] for t in tracks.values()), default=0.) if fresh else 0.
-        detail = click_notice or f"Boxes {len(tracks) if fresh else 0} | best {best:.0%} | steering: 60% + 3 frames"
+        detail = click_notice or "Click a fresh box to select | SPACE land"
         if selected_id is not None:
             status = f"Selection {selected_id}: {status}"
         # Drone frames can be only 320 pixels wide; do not clip the reason a
         # target cannot be selected or confirmed off the right edge.
         font, scale = cv2.FONT_HERSHEY_SIMPLEX, .4
         lines = []
-        for message in (status, f"Inference {inference_ms:.0f} ms | {detail}"):
+        for message in (status, detail):
             line = ""
             for word in message.split():
                 joined = f"{line} {word}".strip()

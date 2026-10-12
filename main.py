@@ -49,9 +49,15 @@ class ManualWindow:
         self.tk = tk
         self.root = tk.Tk()
         self.root.title('Manual control — tracking display only')
-        self.root.resizable(False, False)
-        self.label = tk.Label(self.root, borderwidth=0, takefocus=True)
-        self.label.pack()
+        self.root.resizable(True, True)
+        self.root.geometry('960x540')
+        self.label = tk.Label(self.root, borderwidth=0, takefocus=True,
+                              background='black', width=1, height=1)
+        self.label.pack(fill=tk.BOTH, expand=True)
+        self.on_click = on_click
+        self._image_geometry = None
+        self._viewport = None
+        self._resize_at = self._last_paint = 0.0
         self.held = set()
         self.actions = []
         self.inhibited = False
@@ -59,7 +65,7 @@ class ManualWindow:
         self.root.bind('<KeyPress>', self._press)
         self.root.bind('<KeyRelease>', self._release)
         self.root.bind('<FocusOut>', self._focus_out)
-        self.label.bind('<Button-1>', lambda e: on_click(cv2.EVENT_LBUTTONDOWN, e.x, e.y, None, None))
+        self.label.bind('<Button-1>', self._click_image)
         self.root.protocol('WM_DELETE_WINDOW', self._quit)
         self.label.focus_set()
 
@@ -105,13 +111,50 @@ class ManualWindow:
                   'release all keys after T/H/land/stop' if self.inhibited else None)
         return {'keys': sorted(self.held), 'blocked_reason': reason}
 
+    def _click_image(self, event):
+        if self._image_geometry is None:
+            return
+        source_w, source_h, image_w, image_h = self._image_geometry
+        left = (self.label.winfo_width() - image_w) // 2
+        top = (self.label.winfo_height() - image_h) // 2
+        x, y = event.x - left, event.y - top
+        if 0 <= x < image_w and 0 <= y < image_h:
+            self.on_click(cv2.EVENT_LBUTTONDOWN, int(x * source_w / image_w),
+                          int(y * source_h / image_h), None, None)
+
     def show(self, frame):
-        ok, ppm = cv2.imencode('.ppm', frame)
+        # Always service keys/resize events, even when skipping a display paint.
+        self.root.update()
+        if self.closed:
+            return
+        now = time.monotonic()
+        viewport = (self.label.winfo_width(), self.label.winfo_height())
+        if viewport != self._viewport:
+            self._viewport, self._resize_at = viewport, now
+        if now - self._last_paint < 1 / 30:
+            return
+        h, w = frame.shape[:2]
+        if self._image_geometry is not None and now - self._resize_at < 0.12:
+            # Keep the previous display size during the native zoom animation.
+            # Refit once it settles instead of allocating every intermediate size.
+            _, _, image_w, image_h = self._image_geometry
+        else:
+            scale = min(max(1, viewport[0]) / w, max(1, viewport[1]) / h)
+            image_w, image_h = max(1, round(w * scale)), max(1, round(h * scale))
+        display = frame if (image_w, image_h) == (w, h) else cv2.resize(
+            frame, (image_w, image_h), interpolation=cv2.INTER_LINEAR)
+        ok, ppm = cv2.imencode('.ppm', display)
         if not ok:
             raise RuntimeError('Could not render manual-control frame')
-        self.photo = self.tk.PhotoImage(data=ppm.tobytes(), format='PPM')
-        self.label.configure(image=self.photo)
-        self.root.update()
+        # Reuse Tk's image object: replacing it every frame triggers needless
+        # image allocation/layout work, especially during window transitions.
+        if not hasattr(self, 'photo'):
+            self.photo = self.tk.PhotoImage(data=ppm.tobytes(), format='PPM')
+            self.label.configure(image=self.photo)
+        else:
+            self.photo.configure(data=ppm.tobytes(), format='PPM')
+        self._image_geometry = (w, h, image_w, image_h)
+        self._last_paint = now
 
     def key(self):
         if self.closed:
@@ -157,11 +200,15 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
     fps, last_t = 0.0, time.monotonic()
     recorded_frames = 0
     last_keyboard_status = None
+    video_gap_since = None
+    video_warning_until = 0.0
+    hud.reset_lock()
     manual_hint = 'Focus the window; T requests takeoff'
 
     def on_click(event, x, y, flags, param):
         nonlocal autopilot, target, follow_pending, follow_wait_reason
         if not flight_test and event == cv2.EVENT_LBUTTONDOWN and last_frame is not None:
+            hud.reset_lock()
             if person:
                 autopilot = False
                 follow_pending = False
@@ -185,7 +232,9 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
             ui = ManualWindow(on_click)
         link = DroneLink(flight_test=manual_controls)
         if not manual:
-            cv2.namedWindow(WINDOW)
+            # Let the native window scale the finished camera-size overlay.
+            # AUTOSIZE fights resize/fullscreen transitions on some backends.
+            cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
             cv2.setMouseCallback(WINDOW, on_click)
         if manual:
             print('[main] MANUAL: W/S forward/back, A/D strafe, Q/E rotate; Shift/Ctrl or arrows up/down')
@@ -229,13 +278,9 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
                 if manual and manual_video_ready:
                     command = link.manual_command()
                 state = "LOST" if person else "SEARCHING"
-                if not manual:
-                    cv2.setWindowTitle(WINDOW, WINDOW + " (video unavailable)")
             else:
                 last_frame = frame if fresh else None
                 last_camera = frame.copy()
-                if not manual:
-                    cv2.setWindowTitle(WINDOW, WINDOW if fresh else WINDOW + " (delayed video)")
                 if video.kind == "drone":
                     if fresh:
                         link.note_frame()
@@ -301,9 +346,18 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
                 hint_scale = min(.5, .5 * (view.shape[1] - 20) / max(1, hint_width))
                 cv2.putText(view, mode_hint, (10, 85),
                             cv2.FONT_HERSHEY_SIMPLEX, hint_scale, (0, 255, 255), 2)
-            if not fresh:
-                video_hint = ('WAITING FOR NEXT FRAME' if manual and manual_video_ready else
-                              'VIDEO UNAVAILABLE' if frame is None else 'VIDEO DELAYED')
+            # Debounce only the warning presentation. Commands above still
+            # react immediately to missing/stale video, as before.
+            display_now = time.monotonic()
+            if fresh:
+                video_gap_since = None
+            else:
+                if video_gap_since is None:
+                    video_gap_since = display_now
+                if last_camera is None or display_now - video_gap_since >= 0.3:
+                    video_warning_until = display_now + 0.5
+            if display_now < video_warning_until:
+                video_hint = 'VIDEO DELAYED / WAITING FOR STABLE FRAMES'
                 cv2.putText(view, video_hint, (10, 70),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
             if flight_test:
