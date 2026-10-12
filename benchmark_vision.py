@@ -16,6 +16,7 @@ from vision import PersonTracker
 
 
 def main():
+    # Time the picture finder on saved images, like timing runners with a stopwatch.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', help='Local image or recorded video (no live camera)')
     parser.add_argument('--models', nargs='+', default=['yolo11n.pt'])
@@ -56,6 +57,7 @@ def main():
     for model in args.models:
         for tracker_name in args.trackers:
             for degraded in (False, True):
+                # Try both the original picture and a blurrier, lower-quality copy.
                 tracker = PersonTracker(allow_live_yaw=True, model=model, device=args.device,
                                         imgsz=args.imgsz, tracker=tracker_name + '.yaml')
                 # Prime tracker initialization separately from steady-state timing.
@@ -74,6 +76,8 @@ def main():
                     tracker.find(frame)
                     durations.append((time.perf_counter() - start) * 1000)
                     counts.append(sum(t['conf'] >= .6 for t in tracker._tracks.values()))
+                # The middle timing shows typical speed; p95 is a time that
+                # about 95 out of 100 runs finish within. Box counts are not accuracy.
                 row = dict(model=model, tracker=tracker_name, device=tracker.device,
                            imgsz=args.imgsz, degraded=degraded, frames=len(durations),
                            median_ms=round(float(np.median(durations)), 1),

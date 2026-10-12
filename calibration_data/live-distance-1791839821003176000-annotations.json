@@ -1,0 +1,42 @@
+{
+  "recording": "distance_recordings/distance_1791839821003176000.jsonl",
+  "annotation_date": "2026-10-12",
+  "user_confirmed_marker_order": "Stood at measured spot, then walked to computer to press M.",
+  "timing_basis": "Journal session_seconds; MP4 playback time differs from real elapsed time.",
+  "measurements": [
+    {
+      "marker": 1,
+      "user_reported_distance_feet": 17,
+      "marker_session_seconds": 58.94600666599581,
+      "station_interval_seconds": null,
+      "status": "unresolved_station_timing",
+      "note": "Recording begins only 1.375 seconds before marker 1; opening shows subject reaching toward car. Cannot establish that the 17-foot station was recorded before the walk to the computer."
+    },
+    {
+      "marker": 2,
+      "user_reported_distance_feet": 10.166666666666666,
+      "user_reported_label": "about 10 feet 2 inches",
+      "marker_session_seconds": 97.7030155829998,
+      "station_interval_seconds": null,
+      "status": "candidate_interval_only",
+      "candidate": {
+        "session_interval_seconds": [
+          92,
+          94.5
+        ],
+        "selection_basis": "Visual review: facing camera and holding phone before turning/reaching toward right car at approximately 95\u201396 seconds. Chosen from movement, not agreement with distance label. Exact measured station not confirmed.",
+        "frames": 33,
+        "estimated_frames": 32,
+        "estimate_feet_p10_median_p90": [
+          10.154958029388435,
+          10.511752440991003,
+          10.82885009690402
+        ]
+      }
+    }
+  ],
+  "usage": "User-reported measurements saved for validation only. Neither button-press frame is a confirmed distance reference. Candidate interval must not be used to fit calibration until station timing is confirmed.",
+  "calibration_changed": false,
+  "flight_controls_changed": false,
+  "original_journal_modified": false
+}

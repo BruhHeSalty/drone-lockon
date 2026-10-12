@@ -1,0 +1,167 @@
+{
+  "source": "/Users/saltysalt/Downloads/20261012165212471.MOV",
+  "distance_readings_feet": [
+    19,
+    10,
+    3
+  ],
+  "distance_method": "user-reported iPhone Measure",
+  "camera_height_inches": 23,
+  "camera_orientation": "user reports facing straight ahead",
+  "distance_intervals": [
+    {
+      "start_seconds": 0.5,
+      "end_seconds": 3,
+      "frames": 62,
+      "confirmed_frames": 62,
+      "complete_body_frames": 0,
+      "close_stop_frames": 0,
+      "all_confirmed_box_fractions": {
+        "w": {
+          "p10": 0.17039074420928954,
+          "median": 0.17141539255777993,
+          "p90": 0.17471168041229249
+        },
+        "h": {
+          "p10": 0.6697759501139323,
+          "median": 0.6699107417353878,
+          "p90": 0.6813052142107928
+        }
+      },
+      "complete_body_box_fractions": null,
+      "user_supplied_distance_feet": 19,
+      "distance_kind": "measured",
+      "user_supplied_measured_distance_feet": 19,
+      "status": "MEASUREMENTS_ONLY",
+      "note": "No thresholds changed. A distance label assumes the same person, camera, zoom, pose and distance throughout this interval. This report does not establish stopping distance or validate flight.",
+      "name": "far_reference",
+      "role": "fit",
+      "distance_method": "user-reported iPhone Measure",
+      "estimated_frames": 62,
+      "estimate_feet_p10_median_p90": [
+        18.964953064032652,
+        19.000000001106237,
+        19.53652914581723
+      ],
+      "mean_absolute_difference_from_phone_feet": 0.14148015209576068,
+      "image_size_hold_frames": 62
+    },
+    {
+      "start_seconds": 3,
+      "end_seconds": 13,
+      "frames": 249,
+      "confirmed_frames": 214,
+      "complete_body_frames": 0,
+      "close_stop_frames": 0,
+      "all_confirmed_box_fractions": {
+        "w": {
+          "p10": 0.12660050868988038,
+          "median": 0.1545033613840739,
+          "p90": 0.18196569601694743
+        },
+        "h": {
+          "p10": 0.6644194680673104,
+          "median": 0.6754576365152996,
+          "p90": 0.6886289864999277
+        }
+      },
+      "complete_body_box_fractions": null,
+      "user_supplied_distance_feet": 19,
+      "distance_kind": "measured",
+      "user_supplied_measured_distance_feet": 19,
+      "status": "MEASUREMENTS_ONLY",
+      "note": "No thresholds changed. A distance label assumes the same person, camera, zoom, pose and distance throughout this interval. This report does not establish stopping distance or validate flight.",
+      "name": "far_turn",
+      "role": "same_station_rotation_check",
+      "distance_method": "user-reported iPhone Measure",
+      "estimated_frames": 210,
+      "estimate_feet_p10_median_p90": [
+        18.02416925516411,
+        18.59614416481969,
+        19.388848452130233
+      ],
+      "mean_absolute_difference_from_phone_feet": 0.5664251264739258,
+      "image_size_hold_frames": 214
+    },
+    {
+      "start_seconds": 17.5,
+      "end_seconds": 25.5,
+      "frames": 199,
+      "confirmed_frames": 199,
+      "complete_body_frames": 0,
+      "close_stop_frames": 0,
+      "all_confirmed_box_fractions": {
+        "w": {
+          "p10": 0.22508647918701172,
+          "median": 0.3001620928446452,
+          "p90": 0.3207426071166992
+        },
+        "h": {
+          "p10": 0.9857386208463599,
+          "median": 0.9882851836857972,
+          "p90": 0.9899454835167637
+        }
+      },
+      "complete_body_box_fractions": null,
+      "user_supplied_distance_feet": 10,
+      "distance_kind": "measured",
+      "user_supplied_measured_distance_feet": 10,
+      "status": "MEASUREMENTS_ONLY",
+      "note": "No thresholds changed. A distance label assumes the same person, camera, zoom, pose and distance throughout this interval. This report does not establish stopping distance or validate flight.",
+      "name": "middle_turn",
+      "role": "held_out_distance",
+      "distance_method": "user-reported iPhone Measure",
+      "estimated_frames": 192,
+      "estimate_feet_p10_median_p90": [
+        9.298281189222692,
+        9.844589899956262,
+        10.30016387606092
+      ],
+      "mean_absolute_difference_from_phone_feet": 0.33332582376401004,
+      "image_size_hold_frames": 199
+    },
+    {
+      "start_seconds": 29.5,
+      "end_seconds": 31.5,
+      "frames": 49,
+      "confirmed_frames": 0,
+      "complete_body_frames": 0,
+      "close_stop_frames": 0,
+      "all_confirmed_box_fractions": null,
+      "complete_body_box_fractions": null,
+      "user_supplied_distance_feet": 3,
+      "distance_kind": "measured",
+      "user_supplied_measured_distance_feet": 3,
+      "status": "MEASUREMENTS_ONLY",
+      "note": "No thresholds changed. A distance label assumes the same person, camera, zoom, pose and distance throughout this interval. This report does not establish stopping distance or validate flight.",
+      "name": "near_turn",
+      "role": "held_out_distance",
+      "distance_method": "user-reported iPhone Measure",
+      "estimated_frames": 0,
+      "estimate_feet_p10_median_p90": null,
+      "mean_absolute_difference_from_phone_feet": null,
+      "image_size_hold_frames": 0
+    }
+  ],
+  "interval_status": "user anchors: 19ft at beginning, 10ft around18s, 3ft around30s; analysis windows chosen around stable sections",
+  "exclude_final_camera_shutdown_approach": true,
+  "note": "Phone measurements are reference readings, not independently verified ground truth. No flight settings changed.",
+  "reference_torso_height": 0.22946203500032425,
+  "reference_samples": 62,
+  "reference_interval_seconds": [
+    0.5,
+    3
+  ],
+  "reference_feet": 19,
+  "usage": "offline experimental same-person same-setup torso reference; not flight calibrated",
+  "ground_calibration": null,
+  "tracking_model": "YOLO11s, BoT-SORT, preprocessing on",
+  "pose_model": "YOLO11n-pose",
+  "selected_frames": 664,
+  "total_frames": 911,
+  "usable_torso_frames": 607,
+  "usable_face_frames": 0,
+  "usable_foot_contact_frames": 0,
+  "camera_height_kind": "user reported approximate drone height; lens height not independently verified",
+  "camera_orientation_verified": false
+}

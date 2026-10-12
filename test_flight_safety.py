@@ -51,6 +51,8 @@ class FlightTests(unittest.TestCase):
         module = types.ModuleType('protocols.wifi_uav_rc_protocol_adapter')
         module.WifiUavRcProtocolAdapter = FakeAdapter
         for context in (
+            # Exercise legacy control logic only with the fake adapter/socket/thread below.
+            patch.object(drone, 'LIVE_FLIGHT_BLOCK_REASON', None),
             patch.dict('sys.modules', {'protocols.wifi_uav_rc_protocol_adapter': module}),
             patch.object(drone, '_load_turbodrone'),
             patch.object(drone, '_shared_sock', None),
@@ -460,19 +462,67 @@ class FlightTests(unittest.TestCase):
         self.link.takeoff()
         self.assertIsNone(self.link._takeoff_at)
 
-    def test_close_cancels_takeoff_even_if_tick_runs_before_land(self):
+    def test_close_cancels_queued_takeoff_and_submits_stop_immediately(self):
         self.ready()
         self.link.takeoff()
         self.clock.return_value = 11.0
         self.link._video_time = 11.0
-        original_land = self.link.land
-        def land_after_tick():
-            self.link._tick()
-            original_land()
-        with patch.object(self.link, 'land', side_effect=land_after_tick), patch.object(drone.time, 'sleep'):
+        with patch.object(self.link, 'land') as land, patch.object(drone.time, 'sleep'):
             self.link.close()
+        land.assert_not_called()
         self.assertIsNone(self.link._takeoff_at)
         self.assertFalse(self.last_packet()['takeoff_flag'])
+        self.assertFalse(self.last_packet()['land_flag'])
+        self.assertTrue(self.last_packet()['stop_flag'])
+
+    def test_failed_takeoff_then_close_never_submits_land_toggle(self):
+        # Reproduce the incident: local send succeeds but aircraft ignores T.
+        # The old implementation assumed airborne and sent LAND on close.
+        self.ready()
+        self.link.takeoff()
+        self.link._tick()
+        self.assertTrue(self.link.flying)  # Still unverified request bookkeeping.
+        sent_before_close = len(self.link.rc.sock.sent)
+        with patch.object(drone.time, 'sleep'):
+            self.link.close()
+        for packet, _ in self.link.rc.sock.sent[sent_before_close:]:
+            self.assertTrue(packet['stop_flag'])
+            self.assertFalse(packet['takeoff_flag'])
+            self.assertFalse(packet['land_flag'])
+            self.assertEqual([packet[a] for a in ('yaw', 'pitch', 'throttle', 'roll')], [128] * 4)
+
+    def test_close_overrides_pending_land_calibration_and_motion(self):
+        self.link.flying = True
+        self.link.land()
+        self.link.sticks.calibration_flag = True
+        self.link.sticks.flip_flag = True
+        self.link._calib_left = 20
+        self.link._cmd = dict(yaw=.15, up=.15, forward=.1, right=.1)
+        with patch.object(drone.time, 'sleep'):
+            self.link.close()
+        packet = self.last_packet()
+        self.assertTrue(packet['stop_flag'])
+        for flag in ('takeoff_flag', 'land_flag', 'calibration_flag', 'flip_flag'):
+            self.assertFalse(packet[flag])
+        self.assertEqual(self.link._cmd, drone.HOVER)
+
+    def test_close_without_takeoff_sends_stop_once_and_is_idempotent(self):
+        with patch.object(drone.time, 'sleep'):
+            self.link.close()
+            first_count = len(self.link.rc.sock.sent)
+            self.link.close()
+        self.assertEqual(len(self.link.rc.sock.sent), first_count)
+        self.assertTrue(self.last_packet()['stop_flag'])
+        self.assertFalse(self.last_packet()['land_flag'])
+
+    def test_close_reports_no_submission_when_socket_failed(self):
+        self.link.rc.sock.fail = True
+        with patch.object(drone.time, 'sleep'):
+            self.link.close()
+        reports = [c.kwargs for c in self.link._recorder.record.call_args_list
+                   if c.args[0] == 'shutdown_motor_stop']
+        self.assertEqual(reports[0]['locally_submitted_packets'], 0)
+        self.assertFalse(reports[0]['physical_stop_verified'])
 
     def test_lost_target_commands_hover_immediately(self):
         ctrl = Controller()
@@ -486,13 +536,13 @@ class FlightTests(unittest.TestCase):
                 main.main()
             video.assert_not_called()
 
-    def test_main_lands_before_video_release_on_exception(self):
+    def test_main_closes_control_before_video_release_on_exception(self):
         calls = []
         video, link = Mock(), Mock()
         video.kind = 'drone'
         video.read.side_effect = RuntimeError('simulated video failure')
         video.release.side_effect = lambda: calls.append('video release')
-        link.close.side_effect = lambda: calls.append('land/close link')
+        link.close.side_effect = lambda: calls.append('stop/close link')
         with patch.object(config, 'VIDEO_SOURCE', 'drone'), \
              patch.object(main, 'VideoSource', return_value=video), \
              patch.object(main, 'DroneLink', return_value=link), \
@@ -501,7 +551,7 @@ class FlightTests(unittest.TestCase):
              patch.object(main.cv2, 'destroyAllWindows'):
             with self.assertRaises(RuntimeError):
                 main.main(flight_test=True)
-        self.assertEqual(calls, ['land/close link', 'video release'])
+        self.assertEqual(calls, ['stop/close link', 'video release'])
 
     def test_stale_drone_frame_displayed_but_not_fresh_for_controls(self):
         video = drone.DroneVideo.__new__(drone.DroneVideo)
@@ -549,6 +599,49 @@ class FlightTests(unittest.TestCase):
 @unittest.skipUnless(os.path.isdir(os.path.expanduser(config.TURBODRONE_PATH)),
                      'optional Turbodrone checkout is not installed')
 class WirePacketTests(unittest.TestCase):
+    def setUp(self):
+        # Every encoder test below supplies FakeSocket and suppresses sender threads.
+        guard = patch.object(drone, 'LIVE_FLIGHT_BLOCK_REASON', None)
+        guard.start()
+        self.addCleanup(guard.stop)
+
+    def test_shutdown_wire_packets_are_motor_stop_never_takeoff_land(self):
+        drone._load_turbodrone()
+        from protocols.wifi_uav_rc_protocol_adapter import WifiUavRcProtocolAdapter
+        sock = FakeSocket()
+        adapter = WifiUavRcProtocolAdapter(shared_sock=sock, variant='uav')
+        with patch('protocols.wifi_uav_rc_protocol_adapter.WifiUavRcProtocolAdapter', return_value=adapter), \
+             patch.object(config, 'CONTROL_PORT', 8800), \
+             patch.object(drone, '_shared_sock', None), \
+             patch.object(drone, '_shared_control_link', None), \
+             patch.object(drone.threading, 'Thread'), \
+             patch.object(drone, 'FlightRecorder'), \
+             patch.object(drone.time, 'monotonic', return_value=10.):
+            link = drone.DroneLink()
+            link.note_frame()
+            link.takeoff()
+            link._tick()  # Locally accepted takeoff with no aircraft acknowledgement.
+            sock.sent.clear()
+
+            def flush(_):
+                # First stop was sent synchronously before the flush wait.
+                self.assertEqual(sock.sent[0][0][24], 0x02)
+                for _ in range(link.STOP_PACKETS):
+                    link._tick()
+
+            with patch.object(drone.time, 'sleep', side_effect=flush):
+                link.close()
+            packets = [p for p, address in sock.sent if address[1] == 8800]
+            self.assertEqual(sum(p[24] == 0x02 for p in packets), link.STOP_PACKETS)
+            self.assertEqual(link._stop_packets_submitted, link.STOP_PACKETS)
+            for p in packets:
+                self.assertIn(p[24], (0x00, 0x02))
+                self.assertEqual(p[20:24], bytes([128] * 4))
+                checksum = 0
+                for b in p[20:36]:
+                    checksum ^= b
+                self.assertEqual(p[36], checksum)
+
     def test_native_video_requests_match_rc_and_clear_on_release_loss_and_land(self):
         drone._load_turbodrone()
         from protocols.wifi_uav_rc_protocol_adapter import WifiUavRcProtocolAdapter

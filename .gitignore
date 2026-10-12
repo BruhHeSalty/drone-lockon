@@ -5,3 +5,4 @@ __pycache__/
 run_*.mp4
 test_video.mp4
 flight_logs/
+distance_recordings/

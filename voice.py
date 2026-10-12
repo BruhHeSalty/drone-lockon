@@ -18,6 +18,7 @@ import time
 
 import config
 
+# This is the announcer: turn status changes into short spoken messages.
 _eleven = None
 _voice_id = None
 _speech_lock = threading.Lock()
@@ -91,6 +92,7 @@ def _speak(text):
 
 def _speak_async(text):
     """One speaker, no queue of stale callouts and no overlapping playback."""
+    # Only one voice talks at a time. A helper talks while the video keeps running.
     if not _speech_lock.acquire(blocking=False):
         return False
 
@@ -129,6 +131,7 @@ def _describe_target(frame, target):
         pos = "dead ahead"
 
     if tw > 0.4:
+        # These words come from box size, not a real distance measurement.
         dist = "close range"
     elif tw > 0.15:
         dist = "mid range"
@@ -183,6 +186,7 @@ _REACQUIRED_LINES = [
 
 def announce(state, frame=None, target=None, visual_only=False):
     """Call every frame from main.py. Speaks on state transitions."""
+    # Say something when the situation changes, not for every camera picture.
     global _last_state, _pending_text
 
     # Manual mode describes the camera only. A large box is not proof of
@@ -221,6 +225,7 @@ def announce(state, frame=None, target=None, visual_only=False):
 
 
 def _flush_pending():
+    # Wait for a pause between messages, then try to say the newest one.
     global _last_speak_time, _pending_text
     now = time.monotonic()
     if _pending_text is not None and now - _last_speak_time >= _MIN_INTERVAL:

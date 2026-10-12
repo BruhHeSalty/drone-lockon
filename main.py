@@ -1,5 +1,8 @@
 """Runs the whole thing: video -> vision -> controller -> HUD -> drone.
 
+Live launches are currently blocked after the takeoff-on-close incident.
+The live-mode descriptions below describe the retained, offline-tested logic.
+
 Live first-flight check: python main.py --flight-test (tracking disabled).
 Manual control + tracking display: python main.py --manual.
 Live person framing: python main.py --person (yaw only; click to select).
@@ -15,8 +18,11 @@ Controls (in the video window):
   SPACE   emergency land (also turns autopilot off)
   K       KILL motors — drone drops (also turns autopilot off)
   R       start/stop recording the HUD to a video file
-  Q       quit
+  Q       emergency motor stop and quit (airborne drone drops)
 """
+# Start reading here: this file gets the other helpers working together.
+# Each trip around the main loop reads one picture, finds the target,
+# chooses a command, draws the screen, and checks the keyboard.
 import time
 
 import cv2
@@ -24,7 +30,7 @@ import numpy as np
 
 import config
 from controller import Controller
-from drone import DroneLink, VideoSource, HOVER
+from drone import DroneLink, VideoSource, HOVER, require_safe_live_control
 import hud
 import voice
 from vision import ColorTracker, PersonTracker, AsyncPersonTracker, NOT_FOUND
@@ -40,6 +46,7 @@ MANUAL_KEYS = {
 
 class ManualWindow:
     """Tk supplies key-up and modifier events that HighGUI does not expose."""
+    # This window remembers which keys are still being held down.
     ACTIONS = {'t': ord('t'), 'l': ord(' '), 'space': ord(' '),
                'k': ord('k'), 'h': ord('h'), 'escape': 27, 'r': ord('r'),
                '1': ord('1'), '2': ord('2'), '3': ord('3')}
@@ -86,6 +93,7 @@ class ManualWindow:
             self.inhibited = False
 
     def _focus_out(self, event=None):
+        # If you click another window, forget held keys so movement cannot stick.
         self.held.clear()
         self.actions = [action for action in self.actions if action in (ord('k'), ord(' '), 27)]
         self.actions.append(ord('h'))
@@ -96,6 +104,7 @@ class ManualWindow:
         self.held.clear()
 
     def axes(self):
+        # Opposite keys cancel: forward (1) plus backward (-1) makes zero.
         if self.closed or self.inhibited or self.root.focus_displayof() is None:
             return dict(HOVER)
         keys = self.held
@@ -112,6 +121,7 @@ class ManualWindow:
         return {'keys': sorted(self.held), 'blocked_reason': reason}
 
     def _click_image(self, event):
+        # Map a click on the resized display back to the original camera picture.
         if self._image_geometry is None:
             return
         source_w, source_h, image_w, image_h = self._image_geometry
@@ -179,11 +189,13 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
     if flight_test and person:
         raise ValueError("Choose flight-test or person mode, not both")
     if follow and live:
+        # Real following is blocked here; it is currently only a dry-run preview.
         raise RuntimeError(
             "Live follow is disabled after reported uncontrolled motion/altitude loss. "
             "Neutral sticks have not been verified to hold this drone. "
             "Use --follow --dry-run for tracking preview; do not repeat the live follow launch."
         )
+    require_safe_live_control()  # Reject unsafe live launches before models, video or control sockets.
     if live and (not (flight_test or person) or config.VIDEO_SOURCE != "drone"):
         raise RuntimeError(
             "Live control requires --flight-test, --person or --follow (drone video only). "
@@ -191,6 +203,7 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
         )
     video = link = recorder = raw_recorder = tracker = ui = None
     autopilot = False
+    # Seeing a target is not permission to steer. Automatic steering starts OFF.
     follow_pending = False
     follow_wait_reason = None
     last_tracking_status = None
@@ -211,6 +224,7 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
             hud.reset_lock()
             if person:
                 autopilot = False
+                # Picking someone new cancels the old steering decision immediately.
                 follow_pending = False
                 follow_wait_reason = None
                 controller.disarm_follow()
@@ -238,12 +252,12 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
             cv2.setMouseCallback(WINDOW, on_click)
         if manual:
             print('[main] MANUAL: W/S forward/back, A/D strafe, Q/E rotate; Shift/Ctrl or arrows up/down')
-            print('[main] T takeoff; L/SPACE land; K stop motors; H neutral; Esc land/quit. Tracking cannot steer.')
+            print('[main] T takeoff; L/SPACE land; K stop motors; H neutral; Esc STOP/quit (drone drops). Tracking cannot steer.')
             print('[main] Outcome labels: 1 steady, 2 unstable, 3 crash (operator reports only; no automatic learning)')
             print('[main] After T, release the keys and wait for the 3-second TAKEOFF HOLD countdown to reach READY.')
             print('[main] Person confirmation is visual only; manual movement does not require a target lock.')
         if flight_test:
-            print("[main] FLIGHT TEST: T = takeoff/hover, SPACE = land, K = motor stop, Q = land/quit")
+            print("[main] FLIGHT TEST: T = takeoff/hover, SPACE = land, K = motor stop, Q = STOP/quit (drone drops)")
             print("[main] Tracking/autopilot disabled. One takeoff per session; restart only after confirming landing.")
             print("[main] Manual taps: W/S forward/back, A/D left/right, E/C climb/descend, J/L turn, H neutral")
         if person and not manual:
@@ -255,8 +269,11 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
                 print("[main] Turn only. Selection is remembered out of view; uncertain matches hover until reacquired.")
             if not live:
                 print("[main] DRY RUN: camera/selection preview only; no flight commands")
+        if live:
+            print('[main] Closing the window cuts motors. Use SPACE for a landing request; exit is NOT landing.')
 
         while True:
+            # Step 1: get a picture and check that it is new enough to use.
             frame = video.read()
             fresh = frame is not None and video.fresh
             # A 50 ms read timeout can occur between healthy camera frames.
@@ -287,6 +304,7 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
                 if flight_test or not fresh:
                     target = {"found": False, "x": 0.5, "y": 0.5, "w": 0.0, "h": 0.0, "conf": 0.0}
                 else:
+                    # Step 2: ask the finder where the target is in this picture.
                     target = tracker.find(frame, frame_time=video.frame_time) if person else tracker.find(frame)
                 if follow_pending:
                     reason = (link.tracking_block_reason() if live else None)
@@ -299,6 +317,7 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
                     elif reason != follow_wait_reason:
                         follow_wait_reason = reason
                         print(f"[main] Follow waiting: {reason}; H cancels")
+                # Step 3: turn the target's position into a movement request and label.
                 command, state = controller.update(target) if fresh else (dict(HOVER), "LOST" if person else "SEARCHING")
                 if manual_controls:
                     command = link.manual_command()
@@ -310,6 +329,7 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
                     else:
                         voice.announce(state, frame, target)
                 if autopilot and fresh:
+                    # Step 4: pass on the request only when automatic steering is ON.
                     link.send(command)
                 elif not manual_controls and fresh:
                     link.hover()
@@ -326,6 +346,7 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
                 link.record_event("tracking_state", state=state, target=dict(target), video_fresh=bool(fresh),
                                   autopilot=autopilot, follow_pending=follow_pending)
                 last_tracking_status = tracking_status
+            # Step 5: draw labels and aiming marks on a copy of the picture.
             view = hud.draw(display_frame, target, state, command, autopilot, fps)
             if person:
                 tracker.draw_candidates(view, video_fresh=fresh)
@@ -342,6 +363,14 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
                                     scale, (0, 255, 255), 1)
                 if manual:
                     mode_hint = 'MANUAL: W/S pitch A/D strafe Q/E yaw | Shift/Ctrl altitude'
+                elif not follow_pending and target['found']:
+                    range_reason = controller.person_range_reason(target)
+                    if range_reason:
+                        message = "FORWARD HELD: " + range_reason
+                        width = cv2.getTextSize(message, cv2.FONT_HERSHEY_SIMPLEX, .4, 1)[0][0]
+                        scale = min(.4, .4 * (view.shape[1] - 20) / max(1, width))
+                        cv2.putText(view, message, (10, 70), cv2.FONT_HERSHEY_SIMPLEX,
+                                    scale, (0, 255, 255), 1)
                 hint_width = cv2.getTextSize(mode_hint, cv2.FONT_HERSHEY_SIMPLEX, .5, 2)[0][0]
                 hint_scale = min(.5, .5 * (view.shape[1] - 20) / max(1, hint_width))
                 cv2.putText(view, mode_hint, (10, 85),
@@ -388,7 +417,7 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
                 cv2.putText(view, manual_hint, (10, view.shape[0] - 70),
                             cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 255, 255), 1)
                 for y, text in ((view.shape[0] - 48, 'MANUAL ONLY | T takeoff | L/SPACE land | K motor stop'),
-                                (view.shape[0] - 30, 'H neutral | Esc quit | R record | arrows also control altitude'),
+                                (view.shape[0] - 30, 'H neutral | Esc/close STOP: drone drops | R record'),
                                 (view.shape[0] - 12, 'Label flight: 1 steady / 2 unstable / 3 crash')):
                     cv2.putText(view, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, .4, (255, 255, 255), 1)
                 if recorder is not None and frame is not None:
@@ -412,10 +441,12 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
                 key += ord('a') - ord('A')
 
             # Emergency keys remain available when the video is missing.
+            # Step 6: check keys every loop, even when the camera stops sending pictures.
             if (manual and key == 27) or (not manual and
                     (key == ord("q") or cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) < 1)):
                 break
             elif key == ord(" "):
+                # SPACE cancels automatic steering and asks the drone to land.
                 autopilot = False
                 follow_pending = False
                 controller.disarm_follow()
@@ -444,6 +475,12 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
                     link.hover()
                     print("[main] Follow request cancelled")
                 elif autopilot or (fresh and (not person or target["found"])):
+                    if live and person and not autopilot:
+                        reason = link.tracking_block_reason()
+                        if reason is not None:
+                            print(f"[main] Tracking not enabled: {reason}. T requests takeoff; "
+                                  "press A only after observing a steady hover.")
+                            continue
                     if follow and not autopilot:
                         reason = (link.tracking_block_reason() if live else None) or controller.follow_block_reason(target)
                         if reason is not None:
@@ -470,6 +507,7 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
                 link.hover()
                 link.takeoff()
             elif key == ord("r") and frame is not None:
+                # Save two movies: one with screen labels and one with clean pictures.
                 if recorder is None:
                     h, w = frame.shape[:2]
                     name = f"run_{int(time.time())}.mp4"
@@ -496,7 +534,8 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
             link.record_event("program_error", error=str(exc))
         raise
     finally:
-        # LAND must be flushed before video.release() closes its shared socket.
+        # Clean up even if something goes wrong or the user quits.
+        # Emergency motor stop must flush before video.release() closes its socket.
         try:
             if link is not None:
                 link.close()
@@ -518,6 +557,7 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
 
 
 if __name__ == "__main__":
+    # This runs when you start this file. Read options such as --dry-run first.
     import argparse
 
     parser = argparse.ArgumentParser(description="Drone lock-on demos and isolated flight test")
@@ -526,6 +566,7 @@ if __name__ == "__main__":
     modes.add_argument("--flight-test", action="store_true",
                         help="Live takeoff/manual/landing test; disables tracking and autopilot")
     modes.add_argument("--person", action="store_true", help="Selected-person tracking with yaw only")
+    modes.add_argument('--distance-check', action='store_true', help='Grounded camera-only distance readings and R recording; flight controls disabled')
     modes.add_argument("--follow", action="store_true", help="Follow preview only: requires --dry-run while hover failure is investigated")
     parser.add_argument("--dry-run", action="store_true", help="Disable all outgoing flight commands")
     parser.add_argument("--webcam", action="store_true", help="Use the laptop camera (requires --dry-run)")
@@ -535,6 +576,8 @@ if __name__ == "__main__":
     parser.add_argument("--imgsz", type=int, default=640, help="Person inference size, multiple of 32 (320-1280)")
     parser.add_argument("--tracker", choices=("botsort", "bytetrack"), default="botsort")
     args = parser.parse_args()
+    if args.distance_check:
+        args.dry_run = True
     if args.webcam and not args.dry_run:
         parser.error("--webcam requires --dry-run")
     if args.video and (not args.dry_run or args.webcam):
@@ -545,5 +588,9 @@ if __name__ == "__main__":
         config.VIDEO_SOURCE = "webcam"
     if args.video:
         config.VIDEO_SOURCE, config.VIDEO_FILE = "file", args.video
-    main(flight_test=args.flight_test, person=args.person, follow=args.follow, manual=args.manual, person_options=dict(
-        model=args.model, device=args.device, imgsz=args.imgsz, tracker=args.tracker + ".yaml"))
+    options = dict(model=args.model, device=args.device, imgsz=args.imgsz, tracker=args.tracker + '.yaml')
+    if args.distance_check:
+        from distance_check import run
+        run(person_options=options)
+    else:
+        main(flight_test=args.flight_test, person=args.person, follow=args.follow, manual=args.manual, person_options=options)

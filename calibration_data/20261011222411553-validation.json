@@ -1,0 +1,28 @@
+{
+  "video": "20261011222411553.MOV",
+  "interval_seconds": [
+    0,
+    5
+  ],
+  "location": "opening position by the door",
+  "user_reported_distance_feet": 14,
+  "distance_method": "iPhone Measure; user measured afterwards",
+  "supersedes": {
+    "distance_feet": 12,
+    "kind": "earlier user estimate"
+  },
+  "calibration_role": "held-out check; no refitting",
+  "calibration_reference": "calibration_data/20261012165212471.json",
+  "frames": 125,
+  "estimated_frames": 122,
+  "old_median_feet": 12.000006939864985,
+  "new_median_feet": 14.11128303065695,
+  "median_estimate_absolute_difference_feet": 0.11128303065694922,
+  "mean_absolute_difference_feet": 0.3966832513047525,
+  "new_estimate_feet_p10_median_p90": [
+    13.630322198478332,
+    14.11128303065695,
+    14.836293445070172
+  ],
+  "note": "One measured station in a separate recording. Phone reading is user-reported, not independently surveyed ground truth. Correlated video frames do not count as separate distance trials; no claim about the close-up or other angles."
+}

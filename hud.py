@@ -7,7 +7,10 @@ import math
 import time
 
 import cv2
+import config
 
+# HUD means the words and marks drawn on top of the camera picture.
+# OpenCV colors are three numbers in blue, green, red order (0 to 255 each).
 WHITE = (236, 242, 247)
 RED = (95, 100, 255)
 GREEN = (155, 231, 102)
@@ -34,6 +37,8 @@ STATE_LABELS = {
 
 class _LockAnimation:
     """Presentation-only memory. Never returned to the tracker or controller."""
+    # Make the aiming marks slide smoothly and fade instead of blinking away.
+    # These pretty marks are only for the screen; they never decide movement.
     HOLD = 0.40
     FADE = 0.25
     ACQUIRE = 0.85
@@ -47,6 +52,7 @@ class _LockAnimation:
         self.color = RED
 
     def update(self, target, state, shape, now):
+        # Remember where we drew last time, then move a little toward the new spot.
         expired = self.last_seen is None or now - self.last_seen > self.HOLD + self.FADE
         dt = max(0.0, now - self.last_draw) if self.last_draw is not None else 0.0
         if self.shape != shape or expired:
@@ -92,6 +98,7 @@ def _text(img, text, x, y, scale=0.45, color=WHITE, thick=1, max_width=None):
 
 
 def _panel(img, x0, y0, x1, y1):
+    # Put a dark patch behind the words so bright video does not hide them.
     region = img[max(0, y0):max(0, y1), max(0, x0):max(0, x1)]
     if region.size:
         shade = region.copy()
@@ -107,6 +114,7 @@ def _line(img, start, end, color, thick=1):
 
 def draw(frame, target, state, command, autopilot, fps=0.0):
     """Return an annotated copy at the original resolution (and click coordinates)."""
+    # Draw on a copy so the finder still gets a clean camera picture.
     img = frame.copy()
     h, w = img.shape[:2]
     color = STATE_COLORS.get(state, WHITE)
@@ -192,6 +200,7 @@ def draw(frame, target, state, command, autopilot, fps=0.0):
           0.35 * unit, MUTED, 1, ap_width)
 
     # Signed, zero-centered command meters, including strafe.
+    # These bars show requested movement, not measured speed. Middle means zero.
     cell_w = (w - 2 * pad) / 4
     for index, (key, label) in enumerate((("yaw", "YAW"), ("up", "UP"),
                                          ("forward", "FWD"), ("right", "STRAFE"))):
@@ -215,8 +224,10 @@ def draw(frame, target, state, command, autopilot, fps=0.0):
           max_width=land_w - 16 * unit)
     hint_x = pad + land_w + 14 * unit
     fps_width = int(72 * unit)
-    _text(img, "CLICK pick  /  A auto  /  Q quit", hint_x, h - 21 * unit,
+    quit_hint = ('Q-close CUT MOTORS' if config.CONTROL_PORT is not None else 'Q quit preview')
+    _text(img, f"CLICK pick / A auto / {quit_hint}", hint_x, h - 21 * unit,
           0.38 * unit, WHITE, max_width=w - pad - fps_width - hint_x - 10 * unit)
+    # FPS means frames per second: how many pictures the loop handles each second.
     _text(img, f"{max(0.0, fps):.0f} FPS", w - pad - fps_width, h - 21 * unit,
           0.4 * unit, MUTED, max_width=fps_width)
     return img

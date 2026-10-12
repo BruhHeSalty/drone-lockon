@@ -18,10 +18,13 @@ import numpy as np
 
 import config
 
+# This is the finder's "I cannot see it clearly" answer.
+# x/y say where the middle is; w/h say how big it is; conf says how sure we are.
 NOT_FOUND = {"found": False, "x": 0.5, "y": 0.5, "w": 0.0, "h": 0.0, "conf": 0.0}
 
 
 class ColorTracker:
+    # Look for a patch of one color, like finding a green toy in a picture.
     CONFIRM_FRAMES = 3
     LOST_TIMEOUT_S = 1.0
     MAX_CENTER_STEP = 0.08  # fraction of frame width/height per frame
@@ -47,6 +50,7 @@ class ColorTracker:
         x0, x1 = max(px - radius, 0), min(px + radius, w)
         y0, y1 = max(py - radius, 0), min(py + radius, h)
         patch = cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
+        # Sample a small patch around the click, so one odd dot does not decide.
         self.hsv = np.median(patch.reshape(-1, 3), axis=0).astype(int)
         candidates, mask = self._candidates(frame)
         for contour, target in candidates:
@@ -57,6 +61,7 @@ class ColorTracker:
         print(f"[vision] target color set to HSV {tuple(self.hsv)}")
 
     def _mask(self, hsv_frame):
+        # Make a yes/no picture: white means the color matches, black means no.
         lo = self.hsv - self.tol
         hi = self.hsv + self.tol
         sv_lo = np.clip(lo[1:], 0, 255)
@@ -69,6 +74,7 @@ class ColorTracker:
         else:
             mask = cv2.inRange(hsv_frame, np.array([lo[0], *sv_lo]), np.array([hi[0], *sv_hi]))
         kernel = np.ones((5, 5), np.uint8)
+        # Remove little specks, then fill little holes in the matching patches.
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         return mask
@@ -85,6 +91,8 @@ class ColorTracker:
             if area / (fw * fh) < config.MIN_TARGET_AREA:
                 continue
             x, y, w, h = cv2.boundingRect(contour)
+            # Draw an imaginary box around the patch. Store fractions of the
+            # picture size, so the same rules work with big or small pictures.
             candidates.append((contour, {
                 "found": True,
                 "x": (x + w / 2) / fw,
@@ -96,6 +104,7 @@ class ColorTracker:
         return candidates, mask
 
     def _match_score(self, target):
+        # Compare this patch with the last one. Nearby, similar boxes score better.
         previous = self._previous
         # Limit displacement in both frame units and object-size units.
         dx = abs(target["x"] - previous["x"]) / min(self.MAX_CENTER_STEP, previous["w"])
@@ -137,6 +146,7 @@ class ColorTracker:
             if score is not None:
                 matches.append((score, target))
         matches.sort(key=lambda item: item[0])
+        # If two patches look equally good, say "not found" instead of guessing.
         if not matches or (len(matches) > 1 and matches[1][0] - matches[0][0] < self.AMBIGUITY_MARGIN):
             self._consistent = 0
             return dict(NOT_FOUND)
@@ -159,6 +169,8 @@ class PersonTracker:
     This is an appearance heuristic, not identity proof.
     """
 
+    # YOLO is the picture finder. It draws boxes around people and gives scores.
+    # A track ID is a temporary number for a box, not proof of who a person is.
     CONFIRM_FRAMES = 3
     MAX_APPEARANCE_DISTANCE = 0.30
     APPEARANCE_MARGIN = 0.08
@@ -236,6 +248,7 @@ class PersonTracker:
         stay available for the HUD and appearance matching. One inference pass
         per frame keeps the existing age deadline meaningful.
         """
+        # Tidy noisy colors and brightness so the finder has an easier picture.
         mode = getattr(self, "_preprocess_mode", "off")
         if mode == "off" or (mode == "auto" and not self._drone_video):
             return frame
@@ -278,6 +291,7 @@ class PersonTracker:
 
     def select_track(self, track_id, target, appearance):
         """Select from a displayed detection snapshot, without replaying old frames."""
+        # Remember the clicked person's look, then wait for more clear pictures.
         if appearance is None:
             self.status = "Selection has no usable appearance - click another clear box"
             return
@@ -303,6 +317,8 @@ class PersonTracker:
         Neighboring histogram bins share weight so small lighting/color shifts
         do not look like an entirely different outfit.
         """
+        # Make a tiny color-and-shape summary, like notes about an outfit.
+        # Similar notes help us match boxes, but cannot prove it is the same person.
         height, width = frame.shape[:2]
         x1 = max(0, int((target["x"] - target["w"] * 0.35) * width))
         x2 = min(width, int((target["x"] + target["w"] * 0.35) * width))
@@ -356,6 +372,7 @@ class PersonTracker:
         return False
 
     def _choose_match(self, frame):
+        # Compare visible people with the remembered look. Unsure means wait.
         if self._reference is None:
             return None
         current = self._tracks.get(self._selected_id)
@@ -475,6 +492,7 @@ class PersonTracker:
         self._consistent += 1
         if self._consistent < self.CONFIRM_FRAMES:
             self.status = f"Confirming selected person {self._consistent}/{self.CONFIRM_FRAMES}"
+            # One lucky guess is not enough: wait for three clear matches in a row.
             return dict(NOT_FOUND)
         if match_id != self._selected_id:
             print(f"[vision] Reacquired selected appearance as person track {match_id}")
@@ -499,6 +517,8 @@ class PersonTracker:
 
 class AsyncPersonTracker:
     """One latest-frame worker; stale detections never become flight commands."""
+    # A background helper finds people while the main loop keeps checking keys.
+    # It uses the newest waiting picture instead of building a long waiting line.
 
     MAX_AGE = 0.3
 
@@ -566,6 +586,7 @@ class AsyncPersonTracker:
             return True
 
     def find(self, frame, frame_time=None):
+        # Hand the helper a picture and get its latest answer without waiting.
         now = time.monotonic()
         stamp = now if frame_time is None else frame_time
         with self._condition:
@@ -578,6 +599,7 @@ class AsyncPersonTracker:
                 self._pending = (stamp, frame.copy(), self._generation)
                 self._condition.notify()
             stamp, target = self._result
+            # An old answer is no longer safe to steer with: report "not found".
             return dict(target if 0 <= now - stamp < self.MAX_AGE else NOT_FOUND)
 
     def draw_candidates(self, view, video_fresh=True):
@@ -670,6 +692,7 @@ class AsyncPersonTracker:
                 target = self.tracker.find(frame)
                 with self._condition:
                     if generation == self._generation:
+                        # A new click changes this number. Ignore work for an old click.
                         self._result = (stamp, target)
                         self._snapshot = (frame, dict(self.tracker._tracks), self.tracker.status)
                         self._selected_id = self.tracker._selected_id

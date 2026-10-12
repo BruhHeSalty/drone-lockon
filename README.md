@@ -1,5 +1,28 @@
 # drone-lockon
 
+**Live flight disabled after the 2026-10-12 incident.** The operator reported
+takeoff occurring when the tracking window closed. The current encoder uses the
+same action bit for takeoff and landing, and the application assumes a submitted
+takeoff succeeded without telemetry. The old shutdown landing request could
+therefore launch a grounded drone. **Shutdown now requests emergency motor stop
+instead: an airborne drone will drop, not land.** SPACE still uses the ambiguous
+landing toggle, and physical delivery remains unverified. Both live modes and direct `DroneLink`
+construction now reject live control before opening a control connection.
+There is no command-line override. The live launch instructions below are
+historical and must not be used as a current flight procedure.
+
+See [CHANGELOG.md](CHANGELOG.md) for the complete update summary and file guide,
+[CALIBRATION.md](CALIBRATION.md) for distance evidence, and
+[FLIGHT_INCIDENT_20261012.md](FLIGHT_INCIDENT_20261012.md) for the shutdown defect,
+repair and remaining limitations.
+
+Camera-only `--distance-check` and `--dry-run` previews remain available.
+The intended sequence is explicit **T** takeoff, observe stable hover, then
+explicit **A** for selected-person yaw only. Clicking never takes off or enables
+person-mode autopilot. The local takeoff/settling gate is not airborne feedback.
+See [the incident investigation](FLIGHT_INCIDENT_20261012.md). Live control stays
+blocked until landing and actual flight-state handling are verified.
+
 Camera tracking and a lock-on HUD for the Contixo F19 (WiFi UAV app).
 The laptop processes video and can send flight commands. First verify video
 with commands disabled. Never fly at people.
@@ -207,7 +230,8 @@ disabled. Do not change this while the program is running.
   not steer toward a target; autopilot is disabled in this mode.
 - `P` remains available for optional gyro calibration on a flat surface with motors off.
 - `SPACE` cancels a pending takeoff or requests landing if this program has
-  requested takeoff. `Q` or closing the window also cancels/requests landing.
+  requested takeoff. `Q` or closing the window now requests **emergency motor
+  stop**, regardless of the assumed flight state. An airborne drone will drop.
 - `K` requests immediate motor stop; an airborne drone will drop. It is not a
   normal landing control.
 - After the three-second takeoff settling period, use **short keyboard taps**
@@ -246,10 +270,13 @@ the drone can drift. Keep the normal controller available, but do not assume
 it can override Wi-Fi commands until that handoff has been verified props-off.
 
 The protocol exposes a takeoff/land **toggle**, not a confirmed landing state.
-The program sends a landing toggle before closing the shared video socket and
-preserves it after a known local socket-send failure. It does not repeat a toggle
-after local submission because that could trigger the opposite action. UDP
-submission does not prove receipt or landing; a total Wi-Fi outage can prevent
+On normal shutdown the program cancels queued takeoff/landing/calibration and
+movement, then submits a separate **motor-stop** action immediately. It leaves
+the shared socket open for the existing short stop-packet burst before closing.
+This avoids the ambiguous toggle but cuts motors; it is not controlled landing.
+SPACE's explicit landing toggle is not repeated after local submission because
+that could trigger the opposite action. UDP submission does not prove receipt
+or physical stopping/landing; a total Wi-Fi outage can prevent
 all commands from reaching the drone. Verify physical response and stop testing
 if it differs from the requested action. Offline tests do not certify flight safety.
 
@@ -317,7 +344,7 @@ only print messages; they do not control the drone.
 | `SPACE` | Land and turn autopilot off |
 | `K` | Kill motors immediately (an airborne drone drops) |
 | `R` | Record the HUD to a video file |
-| `Q` | Quit (requests landing if this program considers the drone flying) |
+| `Q` / close window | Emergency motor stop and quit — airborne drone drops |
 
 ## Team and safety
 
@@ -377,6 +404,80 @@ packet layout, axis order/sign, neutral values, and throttle/mode flags.
 The current program has no measured altitude, velocity, or airborne-state
 feedback. Do not guess compensating throttle or trim from detector boxes.
 
+### Measuring the person-size cutoff offline
+
+`calibrate_tracking.py` summarizes selected-person boxes from the full-frame
+evaluation JSON (`rows` with seconds, found, selected_id and tracks). It reports
+width/height percentiles, confirmed/full-body coverage and how often the current
+controller requests a close stop. It never opens a flight connection or changes
+control settings.
+
+```bash
+.venv/bin/python calibrate_tracking.py /path/to/evaluation.json --start 40 --end 50
+```
+
+For a distance reference, record with the drone stationary and propellers removed,
+using the same camera and zoom as tracking. Mark three measured distances, for
+example 8, 10 and 12 feet from the camera. At each mark, stand upright and centered
+with your whole body visible for several seconds; note the times and distances.
+Use farther marks if the body is cropped. Repeat a pose at each mark to assess
+box variation. A moving-camera clip or an estimated distance is only a rough
+comparison, not a measured reference.
+
+After evaluating that recording, add `--distance-feet 10` only for an interval
+spent at the measured 10-foot mark. The report stores that supplied label; it
+does not infer or validate distance. A quoted camera FOV must be identified as
+horizontal, vertical or diagonal before using it for geometry. These measurements
+do not establish braking distance, obstacle clearance or stable hover. Live
+following remains disabled.
+
+For an approximate reference, use `--distance-feet 12 --distance-kind estimated`.
+The report labels this as an estimate and leaves the measured-distance field
+empty. Cropped body boxes are reported separately from complete-body samples.
+
+### Cropped-body review
+
+When a cropped person exceeds the size limit, person mode still requests neutral
+sticks but now stays `LOCKED` and displays `distance unknown`, instead of claiming
+`TARGET REACHED`. Complete-body size stops still use `REACHED`. The same forward
+arming limits remain in force; this status correction does not permit approach.
+
+For close-up recordings, compare the stronger detector explicitly:
+
+```bash
+.venv/bin/python main.py --person --dry-run --model yolo11s.pt --video /path/to/recording.MOV
+```
+
+The smaller default remains because the stronger model regressed on one outdoor
+recording. Select the person in the video; this command opens a dry-run review.
+
+`preview_body_range.py` is a separate offline experiment. It uses local COCO pose
+weights to associate shoulders and hips with the selected person from saved
+full-frame tracking results. Confident, visible torso landmarks can provide a
+relative size measurement even when feet are outside the picture. Weak, clipped
+or ambiguous landmarks produce no estimate. Posture, perspective and camera
+changes still affect the result; there is no depth sensor or flight integration.
+
+```bash
+.venv/bin/python preview_body_range.py \
+  --video /path/to/recording.MOV \
+  --before /path/to/small-model-evaluation.json \
+  --after /path/to/stronger-model-evaluation.json \
+  --weights .venv/share/drone-lockon/yolo11n-pose.pt \
+  --reference-start 0 --reference-end 5 --reference-feet 12 \
+  --output /tmp/cropped-body-before-after.mp4
+```
+
+The reference must show a steady distance and upright posture. `--reference-feet`
+is explicitly an approximate user estimate. The tool writes a video and adjacent
+JSON report; it does not train model weights, change live settings or send flight
+commands. Its pose weights must already be present locally.
+
+Omit `--reference-feet` for footage without a distance reference, including the
+airborne recording. This mode reviews landmark visibility and leaves every
+distance estimate empty; it does not transfer the indoor 12-foot reference to
+a different camera angle.
+
 ### Manual keyboard control with tracking display
 
 `--manual` keeps person detection and click selection visible while giving
@@ -406,7 +507,7 @@ manual input does not repair the protocol or provide position hold.
 | L or SPACE | Request landing |
 | K | Stop motors; the drone drops |
 | H | Cancel held movement and request neutral sticks |
-| Escape | Request landing and quit |
+| Escape / close window | Emergency motor stop and quit — airborne drone drops |
 | R | Start/stop HUD and clean video recordings |
 | 1 / 2 / 3 | Label the attempt steady / unstable / crash |
 
@@ -538,3 +639,75 @@ this does not establish performance on the drone. Use separate labeled drone
 recordings to measure missed people and wrong-person switches before changing defaults.
 
 Tracker reference: [Ultralytics tracking documentation](https://docs.ultralytics.com/modes/track/).
+
+Offline distance comparison: `evaluate_distance_combo.py` reuses saved selected-person
+tracking, checks face/torso size and candidate ground contact, and renders matching
+before/after videos. It needs local YOLO11n pose and OpenCV YuNet weights under
+`.venv/share/drone-lockon` and the existing evaluation JSON files. It has no flight
+connection. See `CALIBRATION.md` for the actual results and calibration limitations.
+
+```bash
+.venv/bin/python evaluate_distance_combo.py --videos /Users/saltysalt/Downloads --evaluations /tmp/drone-tracking-eval --output /tmp/drone-tracking-eval/distance-combo
+.venv/bin/python -m unittest test_distance_combo
+```
+
+Offline left/right centering can be tested without the drone:
+
+```bash
+.venv/bin/python preview_centering.py --videos /Users/saltysalt/Downloads --evaluations /tmp/drone-tracking-eval --output /tmp/drone-tracking-eval/centering-review
+.venv/bin/python -m unittest test_centering_preview
+```
+
+`centering_preview.py` computes a desired yaw from the selected person's horizontal
+position, including when their legs are cropped. It starts turning outside 6% of
+image width from center and stops within 3%, reducing toggling near the boundary.
+Yaw is capped at 15% stick or the configured lower cap; forward, climb and sideways
+are always zero. Controls default off; unconfirmed targets or stale video clear
+the request immediately. The preview shows both the desired turn and the permitted
+output: the existing image-size stop still blocks all movement. This prototype is
+not connected to `main.py` or live flight. Replaying recorded video tests the
+direction decision, not whether a moving drone would successfully stay centered.
+Horizontal yaw centering assumes a forward-facing camera. The known nearly
+downward-facing recording is marked unsupported and produces neutral output;
+yaw in that view can rotate the scene instead of shifting it toward the center.
+
+## Grounded distance check and recording
+
+On the Mac, connect to the drone's Wi-Fi with the drone grounded and motors off.
+Run from the project folder:
+
+```bash
+.venv/bin/python main.py --distance-check --model yolo11s.pt --device cpu
+```
+
+This camera-only mode automatically disables flight control and never constructs
+`DroneLink`. It displays the experimental torso estimate using the measured
+19-foot reference, or `DISTANCE: UNKNOWN` when selection, torso landmarks, image
+aspect ratio or result freshness are unsuitable. Changing camera angle/zoom,
+posture or selected person can invalidate the reference. The distance estimate
+does not steer the drone. Video-protocol traffic is needed to receive the stream.
+
+1. Click yourself in the camera image to select the subject.
+2. Press **R** to start recording; the screen says `RECORDING`.
+3. Stand at each iPhone-measured distance for several seconds. Press **M** to add
+   a numbered measurement marker, then note the phone reading for that marker
+   (for example, `marker 1 = 10 ft`). Markers do not assume a measured distance or
+   silently change calibration.
+4. Press **R** again to save, or **Q/Esc** to save and quit.
+
+Each recording produces `distance_recordings/distance_<timestamp>_hud.mp4`
+(with distance display), `_raw.mp4` (clean frames), and `.jsonl` (actual session
+times, per-frame estimates, calibration metadata and measurement markers).
+Recordings are **silent**. MP4 playback uses fixed 15 fps; the on-screen elapsed
+time and journal preserve actual observation times, so use them when matching
+phone readings. Quitting or an error closes the recording files. This mode has
+no takeoff, autopilot, or landing controls and is for grounded measurement only.
+
+For a no-hardware check, add `--video /path/to/recording.MOV`. A different webcam
+does not inherit the drone calibration; a non-16:9 image explicitly shows unknown.
+The local YOLO11n pose weights are required under `.venv/share/drone-lockon`.
+
+Validation: `test_pipeline.py` and 118 unit tests passed. A real-model check on
+prerecorded 10-foot footage exercised selection, displayed range, R recording,
+M markers and decoding the saved files, without constructing a flight link.
+The new distance screen still requires a live camera-stream test with the drone.

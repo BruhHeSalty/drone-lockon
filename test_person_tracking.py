@@ -109,12 +109,24 @@ class PersonTests(unittest.TestCase):
 
     def test_live_person_loop_starts_off_turns_only_and_lands_without_video(self):
         video, link, worker = Mock(), Mock(), Mock()
+        reason = ['takeoff not requested']
+        link.tracking_block_reason.side_effect = lambda: reason[0]
+        link.takeoff.side_effect = lambda: reason.__setitem__(0, 'takeoff hold')
+        keys = iter([ord('a'), ord('t'), ord('a'), -1, ord('a'), -1, ord(' '), ord('q')])
+
+        def keypress(_):
+            key = next(keys)
+            if key == -1:
+                reason[0] = None  # Simulate completion of the takeoff hold.
+            return key
+
         video.kind = 'drone'
         video.fresh = True
         frame = np.zeros((100, 100, 3), dtype=np.uint8)
-        video.read.side_effect = [frame, frame, None, None]
+        video.read.side_effect = [frame] * 6 + [None, None]
         worker.find.return_value = target()
         with patch.object(config, 'VIDEO_SOURCE', 'drone'), \
+             patch('drone.LIVE_FLIGHT_BLOCK_REASON', None), \
              patch.object(config, 'CONTROL_PORT', 8800), \
              patch.object(main, 'PersonTracker'), \
              patch.object(main, 'AsyncPersonTracker', return_value=worker), \
@@ -126,24 +138,27 @@ class PersonTests(unittest.TestCase):
              patch.object(main.cv2, 'setMouseCallback'), \
              patch.object(main.cv2, 'imshow'), \
              patch.object(main.cv2, 'setWindowTitle'), \
-             patch.object(main.cv2, 'waitKey', side_effect=[ord('a'), -1, ord(' '), ord('q')]), \
+             patch.object(main.cv2, 'waitKey', side_effect=keypress), \
              patch.object(main.cv2, 'getWindowProperty', return_value=1), \
              patch.object(main.cv2, 'destroyAllWindows'):
             main.main(person=True)
         link.send.assert_called_once_with(dict(yaw=.15, up=0., forward=0., right=0.))
+        link.takeoff.assert_called_once()  # A on ground/while settling never launches or enables.
         self.assertEqual(link.method_calls[1][0], 'hover')  # First frame: autopilot off.
         link.land.assert_called_once()
         link.close.assert_called_once()
         worker.close.assert_called_once()
         # Dropped camera frames still render the controls/status, but they must
         # not retain a visible lock or an old steering command.
-        self.assertEqual(draw.call_count, 4)
-        for call in draw.call_args_list[2:]:
+        self.assertEqual(draw.call_count, 8)
+        for call in draw.call_args_list[:5]:
+            self.assertFalse(call.args[4])
+        for call in draw.call_args_list[6:]:
             self.assertFalse(call.args[1]['found'])
             self.assertEqual(call.args[2], 'LOST')
             self.assertEqual(call.args[3], HOVER)
         self.assertEqual([c.kwargs['video_fresh'] for c in worker.draw_candidates.call_args_list],
-                         [True, True, False, False])
+                         [True] * 6 + [False, False])
 
     def test_capture_delay_counts_toward_detection_expiry(self):
         detector = Mock()

@@ -15,6 +15,24 @@ def person(**changes):
 
 
 class FollowTests(unittest.TestCase):
+    def test_cropped_tall_person_holds_without_claiming_distance_reached(self):
+        far_cropped = person(x=.6, y=.63, w=.19, h=.73)
+        for follow in (False, True):
+            ctrl = Controller(person_mode=True, follow_mode=follow)
+            cmd, state = ctrl.update(far_cropped)
+            self.assertEqual(cmd, HOVER)
+            self.assertEqual(state, 'LOCKED')
+            self.assertIn('distance unknown', ctrl.person_range_reason(far_cropped))
+        self.assertFalse(self.ctrl.arm_follow(far_cropped))
+        self.assertIn('distance unknown', self.ctrl.follow_block_reason(far_cropped))
+
+    def test_close_full_body_still_stops_and_reports_size_limit(self):
+        close = person(w=.35, h=.7)
+        cmd, state = self.ctrl.update(close)
+        self.assertEqual(cmd, HOVER)
+        self.assertEqual(state, 'REACHED')
+        self.assertIn('image-size stop limit', self.ctrl.person_range_reason(close))
+
     def setUp(self):
         self.ctrl = Controller(person_mode=True, follow_mode=True)
         self.clock = patch('controller.time.monotonic', return_value=10.)

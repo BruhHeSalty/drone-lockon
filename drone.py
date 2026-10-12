@@ -28,13 +28,32 @@ import numpy as np
 
 import config
 
+# Zero on every control means "do not ask for movement." It does not prove
+# the drone is staying in one place; we cannot measure that here.
 HOVER = {"yaw": 0.0, "up": 0.0, "forward": 0.0, "right": 0.0}
+
+# Incident 2026-10-12: closing after an unconfirmed takeoff sent the shared
+# takeoff/land toggle and the operator reported an unexpected launch. Neither
+# sendto() nor self.flying establishes the physical state. Shutdown now requests
+# motor stop, but SPACE still uses the ambiguous toggle. No CLI override:
+# restore live operation only after landing/state handling is verified.
+LIVE_FLIGHT_BLOCK_REASON = (
+    "Live flight is disabled after an unexpected takeoff on program close. "
+    "The current takeoff/land toggle cannot guarantee landing without flight-state feedback. "
+    "Use --dry-run or --distance-check; keep the drone grounded."
+)
+
+
+def require_safe_live_control():
+    if config.CONTROL_PORT is not None and LIVE_FLIGHT_BLOCK_REASON:
+        raise RuntimeError(LIVE_FLIGHT_BLOCK_REASON)
 
 # Set by DroneVideo; DroneLink sends its packets on the same UDP socket.
 _shared_sock = None
 _shared_control_link = None
 
 def _load_turbodrone():
+    # Find the helper library that knows how to write messages the drone understands.
     path = os.path.expanduser(config.TURBODRONE_PATH)
     if not os.path.isdir(path):
         raise RuntimeError(
@@ -50,6 +69,7 @@ class VideoSource:
     """Gives frames from a file, the webcam, or the drone."""
 
     def __init__(self, kind=None):
+        # Choose our eyes: a saved movie, the laptop camera, or the drone camera.
         kind = config.VIDEO_SOURCE if kind is None else kind
         self.kind = kind
         if kind == "file":
@@ -106,6 +126,7 @@ class _LatestFrameVideo:
         super().__init__(*args, **kwargs)
 
     def handle_payload(self, payload):
+        # Pictures arrive as little pieces. Let the helper put them together.
         # This mutates received_fragments; the watchdog concurrently iterates
         # that set to build ACKs. Completion also requests an ACK recursively,
         # so this must be reentrant rather than a plain Lock.
@@ -115,6 +136,7 @@ class _LatestFrameVideo:
             now = time.monotonic()
             with self._frame_ready:
                 if self._latest_frame is not None:
+                    # Replace an unread picture with the newer one to avoid falling behind.
                     self.frames_skipped += 1
                 self._latest_frame = frame
                 self.frames_received += 1
@@ -129,6 +151,8 @@ class _LatestFrameVideo:
             return super()._build_ack_slots(seq)
 
     def _safe_sendto(self, payload, port, label):
+        # An ACK says "got your video." It also carries joystick numbers, so
+        # those numbers must agree with the movement request we are sending.
         # Native video ACKs also contain RC bytes. Sending the upstream
         # neutral default between movement packets fights keyboard input.
         link = _shared_control_link
@@ -213,6 +237,7 @@ class DroneVideo:
             return False, None
         # Display late frames too, but never treat them as fresh control feedback.
         age = time.time() - frame.timestamp
+        # The picture's age matters: seeing where something WAS is not enough.
         self.frame_time = time.monotonic() - max(0.0, age)
         img = cv2.imdecode(np.frombuffer(frame.data, np.uint8), cv2.IMREAD_COLOR)
         self.fresh = img is not None and -0.1 <= age <= 0.3
@@ -227,6 +252,8 @@ class DroneVideo:
 # -------------------------------------------------------------- CONTROL
 class FlightRecorder:
     """Append-only diagnostic journal; disk I/O stays off the control thread."""
+    # Keep a notebook of what the program tried. A helper writes it to disk so
+    # a slow disk does not make the movement-message loop wait.
 
     def __init__(self, directory="flight_logs"):
         directory = Path(directory)
@@ -282,11 +309,13 @@ class FlightRecorder:
 
 def _stick(value):
     """-1..1 -> 0..255 with 128 = center."""
+    # Translate our small movement number into the drone's joystick number.
     return int(max(0, min(255, round(128 + value * 127))))
 
 
 class _Sticks:
     """The fields Turbodrone's packet builder reads."""
+    # Drone names: pitch = forward/back, throttle = up/down, roll = slide sideways.
 
     def __init__(self):
         self.yaw = self.pitch = self.throttle = self.roll = 128
@@ -318,6 +347,7 @@ class DroneLink:
 
     def __init__(self, flight_test=False):
         global _shared_control_link
+        require_safe_live_control()  # Before loading an adapter, opening sockets or starting a sender.
         self.dry_run = config.CONTROL_PORT is None
         self.flight_test = flight_test
         self.flying = False
@@ -343,6 +373,7 @@ class DroneLink:
         self._manual_until = 0.0
         self._hold_until = 0.0
         self._stop_left = 0
+        self._stop_packets_submitted = 0
         self._calib_left = 0
         self._takeoff_at = None   # request consumed by the next sender tick
         self._video_time = None
@@ -393,6 +424,7 @@ class DroneLink:
         self._attempt_at = None
 
     def _loop(self):
+        # Keep sending like a heartbeat; the drone expects regular messages.
         while self._running:
             self._tick()
             time.sleep(1 / self.RATE_HZ)
@@ -410,6 +442,7 @@ class DroneLink:
             self._video_time = now
 
     def video_lost(self):
+        # No fresh eyes: cancel pending takeoff and clear movement requests.
         if self.dry_run:
             return
         with self._lock:
@@ -442,6 +475,8 @@ class DroneLink:
 
     def _effective_command(self, now):
         """Caller holds _lock; same decision for RC and embedded video controls."""
+        # Last safety gate: old instructions, old pictures, or a broken link
+        # must produce zero movement requests, even if an earlier step said go.
         cmd = self._cmd
         if self.flight_test:
             cmd = self._manual_cmd if now < self._manual_until else HOVER
@@ -463,6 +498,7 @@ class DroneLink:
         return bytes(packet)
 
     def _tick(self):
+        # Send one heartbeat: check safety, pack the joystick numbers, and send.
         now = time.monotonic()
         try:
             with self._lock:
@@ -496,6 +532,8 @@ class DroneLink:
                 calibrating = self.sticks.calibration_flag
                 packet = self.rc.build_control_packet(self.sticks)
                 accepted = self._transmit(packet)
+                if stopping and accepted:
+                    self._stop_packets_submitted += 1
                 signature = (tuple(cmd.values()), accepted, taking_off, landing, stopping, calibrating, self._control_fault)
                 if signature != self._last_packet_log or now - self._packet_log_time >= .1:
                     self.record_event("control_packet", command=dict(cmd),
@@ -550,6 +588,7 @@ class DroneLink:
                 self._last_error = now
 
     def send(self, cmd):
+        # Save the newest request for the sending helper. In dry run, just print it.
         if self.dry_run:
             now = time.time()
             if now - self._last_print > 0.5:
@@ -575,6 +614,7 @@ class DroneLink:
         These are normalized stick requests, not angles, speeds or altitude.
         The tracker cannot call this through the ordinary send() path.
         """
+        # Held keys must keep checking in. If the window freezes, their request expires.
         if set(axes) != set(HOVER) or any(not isinstance(v, (int, float))
                                         or not math.isfinite(v) or not -1 <= v <= 1 for v in axes.values()):
             self.hover()
@@ -710,6 +750,7 @@ class DroneLink:
 
     def takeoff(self):
         """T. Request takeoff directly, without automatic calibration or delay."""
+        # This asks for takeoff; it cannot tell us whether the drone really lifted off.
         if self.dry_run:
             print("[drone] DRY RUN — would request takeoff")
             return
@@ -732,8 +773,12 @@ class DroneLink:
             print("[drone] Takeoff requested")
 
     def land(self):
-        """SPACE. Takeoff and land are the same toggle bit on this drone, so it
-        is only sent while flying — otherwise it would take off instead."""
+        """Legacy SPACE toggle request; physical landing is NOT guaranteed.
+
+        self.flying records a request, not measured airborne state. This is
+        unsafe after a failed/unconfirmed takeoff: the toggle can launch instead.
+        Live construction is blocked until this protocol/state issue is resolved.
+        """
         print("[drone] LAND")
         if self.dry_run:
             return
@@ -756,30 +801,47 @@ class DroneLink:
         if self.dry_run:
             return
         with self._lock:
-            self.record_event("motor_stop_requested")
-            self._finish_attempt("motor_stop_requested")
-            self._takeoff_at = None
-            self._calib_left = 0
-            self.sticks.takeoff_flag = self.sticks.land_flag = False
-            self._cmd = dict(HOVER)
-            self._manual_until = 0.0
-            self._stop_left = self.STOP_PACKETS
-            self._used_takeoff = True
-            self.flying = False
+            self._request_motor_stop_locked('motor_stop_requested')
+
+    def _request_motor_stop_locked(self, reason):
+        """Cancel other actions atomically. Caller holds _lock."""
+        self.record_event("motor_stop_requested", reason=reason)
+        self._finish_attempt(reason)
+        self._takeoff_at = None
+        self._calib_left = 0
+        self.sticks.takeoff_flag = self.sticks.land_flag = False
+        self.sticks.calibration_flag = self.sticks.flip_flag = False
+        self.sticks.camera_tilt_state = 0
+        self._cmd = dict(HOVER)
+        self._manual_cmd = dict(HOVER)
+        self._manual_until = 0.0
+        self._stop_left = self.STOP_PACKETS
+        self._stop_packets_submitted = 0
+        self._used_takeoff = True
+        self.flying = False
 
     def close(self):
         global _shared_control_link
         if self.dry_run or self._closed:
             return
         with self._lock:
+            if self._closed:
+                return
             self._closed = True
-        self.land()  # also cancels a scheduled takeoff while still on the ground
+            # User-selected exit policy: CUT MOTORS, never send the takeoff/land
+            # toggle based on assumed flight state. An airborne drone will drop.
+            self._request_motor_stop_locked('program_close')
+        print('[drone] EXIT: EMERGENCY MOTOR STOP — airborne drone will drop')
+        self._tick()  # Submit immediately, even if the background sender stalled.
         # Keep the shared video socket alive until this flush is finished.
         time.sleep(self.SHUTDOWN_S)
         self._running = False
         self._thread.join(timeout=1.0)
-        if self.sticks.land_flag:
-            print("[drone] WARNING: landing packet could not be submitted; physical landing is unconfirmed")
+        self.record_event('shutdown_motor_stop',
+                          locally_submitted_packets=self._stop_packets_submitted,
+                          unsent_repetitions=self._stop_left, physical_stop_verified=False)
+        if not self._stop_packets_submitted:
+            print('[drone] WARNING: motor-stop could not be submitted; physical stop is unconfirmed')
         try:
             self.rc.stop()
         finally:
