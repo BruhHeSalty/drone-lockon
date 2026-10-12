@@ -1,15 +1,17 @@
 # drone-lockon
 
-**Live flight disabled after the 2026-10-12 incident.** The operator reported
-takeoff occurring when the tracking window closed. The current encoder uses the
-same action bit for takeoff and landing, and the application assumes a submitted
-takeoff succeeded without telemetry. The old shutdown landing request could
-therefore launch a grounded drone. **Shutdown now requests emergency motor stop
-instead: an airborne drone will drop, not land.** SPACE still uses the ambiguous
-landing toggle, and physical delivery remains unverified. Both live modes and direct `DroneLink`
-construction now reject live control before opening a control connection.
-There is no command-line override. The live launch instructions below are
-historical and must not be used as a current flight procedure.
+**Live testing is restricted to manual `--flight-test` and turn-only `--person`,
+re-enabled at the operator's request.** Following, unrestricted control and
+`--manual` remain blocked. The operator previously reported takeoff when the
+tracking window closed: the encoder uses the same action bit for takeoff and
+landing, and submitted takeoff is not confirmed by telemetry. **Shutdown now
+requests emergency motor stop: an airborne drone will drop, not land.** SPACE
+still uses the ambiguous landing toggle; physical delivery remains unverified.
+
+Subsequent physical tests included failed lift and an upside-down flip despite
+neutral logged movement values. The cause is unresolved. The takeoff timer does
+not establish actual lift and can permit A while still grounded. Do not treat
+the software checks below as proof that powered flight is reliable.
 
 See [CHANGELOG.md](CHANGELOG.md) for the complete update summary and file guide,
 [CALIBRATION.md](CALIBRATION.md) for distance evidence, and
@@ -20,8 +22,38 @@ Camera-only `--distance-check` and `--dry-run` previews remain available.
 The intended sequence is explicit **T** takeoff, observe stable hover, then
 explicit **A** for selected-person yaw only. Clicking never takes off or enables
 person-mode autopilot. The local takeoff/settling gate is not airborne feedback.
-See [the incident investigation](FLIGHT_INCIDENT_20261012.md). Live control stays
-blocked until landing and actual flight-state handling are verified.
+See [the incident investigation](FLIGHT_INCIDENT_20261012.md). Enabling these
+restricted modes does not establish reliable landing or actual flight state.
+
+## Turn-only test with distance display and recording
+
+```sh
+.venv/bin/python -u main.py --person --model yolo11s.pt --device cpu --distance-view
+```
+
+The distance display replaces the animated lock-on HUD. Thin person boxes remain
+clickable. Distance is experimental and display-only: it never commands approach
+or altitude. Camera angle and posture can invalidate the stationary calibration;
+unreliable, cropped or stale observations show **UNKNOWN**. Pose analysis runs in
+the background on the frame matched to the selected person.
+
+- **T** starts recording, then requests takeoff. Autopilot stays OFF.
+- Observe steady hover, click yourself, then press **A** for left/right turning.
+  The final transport gate permits yaw only, capped at 0.15 or the lower configured
+  limit; all other axes stay neutral. Lost/close targets still stop commands.
+- **R** toggles recording; **M** adds a timed bookmark. Compare stationary
+  intervals with separately measured iPhone distances, not the moment you walk
+  over to press M. Recording does not automatically train or recalibrate anything.
+- **H** turns tracking off. **SPACE** requests landing. **K**, **Q**, or normal
+  window close requests motor stop; an airborne drone drops. Connection loss or
+  force-quitting can prevent delivery.
+
+Recordings go to `distance_recordings/`: clean `_raw.mp4`, distance `_hud.mp4`,
+and `.jsonl` with source/session times, estimates, selected targets, requested
+commands, autopilot state and markers. Video plays at fixed 15 fps; use journal
+timestamps for timing. A recording startup failure prevents that T request;
+a later recording failure is reported while flight keys remain available.
+Neutral axes do not prove the drone holds its physical position.
 
 Camera tracking and a lock-on HUD for the Contixo F19 (WiFi UAV app).
 The laptop processes video and can send flight commands. First verify video
@@ -647,14 +679,14 @@ before/after videos. It needs local YOLO11n pose and OpenCV YuNet weights under
 connection. See `CALIBRATION.md` for the actual results and calibration limitations.
 
 ```bash
-.venv/bin/python evaluate_distance_combo.py --videos /Users/saltysalt/Downloads --evaluations /tmp/drone-tracking-eval --output /tmp/drone-tracking-eval/distance-combo
+.venv/bin/python evaluate_distance_combo.py --videos /path/to/calibration_videos --evaluations /tmp/drone-tracking-eval --output /tmp/drone-tracking-eval/distance-combo
 .venv/bin/python -m unittest test_distance_combo
 ```
 
 Offline left/right centering can be tested without the drone:
 
 ```bash
-.venv/bin/python preview_centering.py --videos /Users/saltysalt/Downloads --evaluations /tmp/drone-tracking-eval --output /tmp/drone-tracking-eval/centering-review
+.venv/bin/python preview_centering.py --videos /path/to/calibration_videos --evaluations /tmp/drone-tracking-eval --output /tmp/drone-tracking-eval/centering-review
 .venv/bin/python -m unittest test_centering_preview
 ```
 

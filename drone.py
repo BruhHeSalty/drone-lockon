@@ -35,17 +35,20 @@ HOVER = {"yaw": 0.0, "up": 0.0, "forward": 0.0, "right": 0.0}
 # Incident 2026-10-12: closing after an unconfirmed takeoff sent the shared
 # takeoff/land toggle and the operator reported an unexpected launch. Neither
 # sendto() nor self.flying establishes the physical state. Shutdown now requests
-# motor stop, but SPACE still uses the ambiguous toggle. No CLI override:
-# restore live operation only after landing/state handling is verified.
+# motor stop, but SPACE still uses the ambiguous toggle. The operator requested
+# resuming manual tests and yaw-only tracking; unrestricted control stays blocked.
 LIVE_FLIGHT_BLOCK_REASON = (
-    "Live flight is disabled after an unexpected takeoff on program close. "
+    "Unrestricted live flight is disabled after an unexpected takeoff on program close. "
     "The current takeoff/land toggle cannot guarantee landing without flight-state feedback. "
-    "Use --dry-run or --distance-check; keep the drone grounded."
+    "Only explicit --flight-test or turn-only --person modes are available."
 )
 
 
-def require_safe_live_control():
-    if config.CONTROL_PORT is not None and LIVE_FLIGHT_BLOCK_REASON:
+def require_safe_live_control(*, flight_test=False, yaw_only=False):
+    if flight_test and yaw_only:
+        raise ValueError('Choose manual flight test or yaw-only control, not both')
+    if (config.CONTROL_PORT is not None and LIVE_FLIGHT_BLOCK_REASON
+            and flight_test is not True and yaw_only is not True):
         raise RuntimeError(LIVE_FLIGHT_BLOCK_REASON)
 
 # Set by DroneVideo; DroneLink sends its packets on the same UDP socket.
@@ -345,11 +348,12 @@ class DroneLink:
     MANUAL_LIMITS = {"forward": 0.12, "right": 0.12, "up": 0.15, "yaw": 0.15}
     KEYBOARD_LIMITS = {"forward": 0.20, "right": 0.20, "up": 0.20, "yaw": 0.20}
 
-    def __init__(self, flight_test=False):
+    def __init__(self, flight_test=False, yaw_only=False):
         global _shared_control_link
-        require_safe_live_control()  # Before loading an adapter, opening sockets or starting a sender.
+        require_safe_live_control(flight_test=flight_test, yaw_only=yaw_only)
         self.dry_run = config.CONTROL_PORT is None
         self.flight_test = flight_test
+        self.yaw_only = yaw_only
         self.flying = False
         self._closed = False
         self._last_print = 0.0
@@ -483,6 +487,15 @@ class DroneLink:
         if (self._closed or self._control_fault or not self.flying or now < self._hold_until
                 or now - self._cmd_time > self.STALE_S or not self._video_ready(now)):
             return HOVER
+        if self.yaw_only:
+            # Final transport gate, also used by video ACKs: tracker/controller
+            # mistakes cannot request translation or altitude in person mode.
+            yaw = cmd.get('yaw', 0.)
+            cap = config.MAX_YAW
+            if not isinstance(yaw, (int, float)) or not math.isfinite(yaw):
+                return HOVER
+            cap = max(0., min(.15, cap)) if isinstance(cap, (int, float)) and math.isfinite(cap) else 0.
+            return dict(HOVER, yaw=max(-cap, min(cap, yaw)))
         return cmd
 
     def _video_ack_payload(self, payload):
@@ -777,7 +790,7 @@ class DroneLink:
 
         self.flying records a request, not measured airborne state. This is
         unsafe after a failed/unconfirmed takeoff: the toggle can launch instead.
-        Live construction is blocked until this protocol/state issue is resolved.
+        Restricted tests are enabled; this protocol/state issue remains unresolved.
         """
         print("[drone] LAND")
         if self.dry_run:

@@ -1,10 +1,34 @@
 # Changes
 
+## 2026-10-12 — Restricted live tests and recorded distance view
+
+- Recorded subsequent failed-lift/flip findings and the unresolved assumed-flight
+  state limitation; this checkpoint does not claim a fix for physical instability.
+- Expanded media/session-log exclusions and removed identifying local paths and
+  personal height from current documentation. Prior Git history is unchanged.
+- At the operator's request, re-enabled explicit `--flight-test` and yaw-only
+  `--person`. Unrestricted control, `--manual` and live following remain blocked.
+- Added final yaw-only enforcement to both control and video ACK packets: other
+  axes stay neutral, yaw is capped at 0.15 or the lower configured limit, and
+  invalid yaw produces neutral output. T and then a separate A remain required.
+- Added `--person --distance-view`: experimental feet/UNKNOWN replaces the
+  animated lock-on HUD. `flight_distance.py` runs pose analysis in a background
+  worker using matched source frames; stale or changed selections discard old
+  estimates. Distance does not feed flight control.
+- T starts clean video, annotated video and a timestamped journal before takeoff.
+  R toggles recording; M bookmarks it. Pose/recording failures are isolated from
+  flight key handling. Measured stationary intervals are needed for later review.
+- Added tests for scoped live-mode permissions, final command restrictions,
+  asynchronous distance freshness/selection, recording output and disk failures.
+  Shutdown still requests motor stop; the existing landing-toggle and physical
+  acknowledgement limitations remain unresolved. Verification uses fake hardware.
+
 ## 2026-10-12 — Distance review, centering previews and shutdown repair
 
 This update saves the work since `9ff5490` on `codex/person-tracking-review`.
-Live flight is disabled. Camera-only distance measurement and offline previews
-remain available. The tests below verify software behavior, not flight safety.
+This commit initially disabled live flight; the subsequent restricted resumption
+is documented above. Camera-only distance measurement and offline previews remain
+available. The tests below verify software behavior, not flight safety.
 
 ### Flight controls and the shutdown incident
 

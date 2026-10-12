@@ -602,6 +602,22 @@ class AsyncPersonTracker:
             # An old answer is no longer safe to steer with: report "not found".
             return dict(target if 0 <= now - stamp < self.MAX_AGE else NOT_FOUND)
 
+    def distance_observation(self, video_fresh=True):
+        """Return a matched frame/target snapshot for display-only pose analysis.
+
+        Do not pair an asynchronous detection with a newer camera image. This
+        also remembers exactly which boxes the distance screen makes selectable.
+        """
+        with self._condition:
+            stamp, target = self._result
+            frame, tracks, status = self._snapshot
+            fresh = video_fresh and frame is not None and 0 <= time.monotonic() - stamp < self.MAX_AGE
+            self._displayed = (stamp, self._snapshot, self._generation) if fresh else None
+            if not fresh:
+                return None
+            return dict(frame=frame, target=dict(target), tracks={i: dict(t) for i, t in tracks.items()},
+                        status=status, source_frame_time=stamp, generation=self._generation)
+
     def draw_candidates(self, view, video_fresh=True):
         """Briefly retain visual boxes; stale boxes never become selectable."""
         now = time.monotonic()

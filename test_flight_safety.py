@@ -81,6 +81,38 @@ class FlightTests(unittest.TestCase):
         self.link.takeoff()
         self.assertEqual(self.link._takeoff_at, 10.0)
 
+    def test_yaw_only_transport_rejects_translation_caps_turning_and_holds_on_loss(self):
+        # Restore an active restriction to exercise the explicit yaw-only path.
+        # setUp has already replaced every socket, adapter and sender thread.
+        with patch.object(drone, 'LIVE_FLIGHT_BLOCK_REASON', 'unrestricted blocked'):
+            link = drone.DroneLink(yaw_only=True)
+        desired = dict(yaw=1., forward=1., right=-1., up=1.)
+        link.note_frame()
+        link.send(desired)
+        link._tick()
+        self.assertEqual(link.rc.sock.sent[-1][0]['yaw'], 128)  # T is required.
+        link.takeoff()
+        link._tick()
+        self.assertEqual(link.rc.sock.sent[-1][0]['yaw'], 128)  # Settling hold.
+        self.clock.return_value = 13.1
+        link.note_frame()
+        for yaw, expected in ((1., .15), (-1., -.15), (0., 0.), (float('nan'), 0.), (float('inf'), 0.)):
+            link.send(dict(desired, yaw=yaw))
+            link._tick()
+            packet = link.rc.sock.sent[-1][0]
+            self.assertEqual(packet['yaw'], drone._stick(expected))
+            self.assertEqual([packet[a] for a in ('pitch', 'throttle', 'roll')], [128] * 3)
+            ack = link._video_ack_payload(bytes(40))
+            self.assertEqual(ack[20:24], bytes([drone._stick(expected), 128, 128, 128]))
+        with patch.object(config, 'MAX_YAW', .05):
+            link.send(desired)
+            link._tick()
+            self.assertEqual(link.rc.sock.sent[-1][0]['yaw'], drone._stick(.05))
+        link.video_lost()
+        link._tick()
+        self.assertEqual(link.rc.sock.sent[-1][0]['yaw'], 128)
+        self.assertFalse(link.manual_nudge('forward', 1))
+
     def test_short_attempt_is_suspected_failure_not_claimed_airtime(self):
         self.ready()
         self.link.takeoff()

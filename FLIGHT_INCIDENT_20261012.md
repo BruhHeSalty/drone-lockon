@@ -47,7 +47,7 @@ Repeated toggle transmissions, assumed flight state, or speculative throttle
 commands are not a safe repair. A software close callback also cannot guarantee
 delivery if the application is forcibly killed or the connection is lost.
 
-## Containment and intended workflow
+## Initial containment and intended workflow
 
 - All normal live modes and direct live `DroneLink` construction now fail before
   control sockets or sender threads are created. No CLI bypass was added.
@@ -100,5 +100,40 @@ neutral axes and valid checksums, and no takeoff/landing action bit. Existing
 exception cleanup still flushes control before releasing the video socket.
 
 This fixes the observed shutdown toggle path in software. It does not establish
-physical stop reliability or resolve SPACE's ambiguous landing toggle. The live
-flight interlock remains in place; nothing was sent to the drone for these tests.
+physical stop reliability or resolve SPACE's ambiguous landing toggle. At this
+repair stage, the live flight interlock remained in place; nothing was sent to
+the drone for these tests.
+
+## Subsequent restricted resumption at operator request
+
+The operator explicitly requested resuming manual takeoff and yaw-only centering,
+accepting emergency motor stop on close. `--flight-test` and turn-only `--person`
+are now enabled; generic control, `--manual` and live following remain blocked.
+This supersedes the initial blanket containment above, not the incident findings.
+The final output gate caps yaw at 0.15 or the lower configured limit and zeros
+every other axis, including in video ACKs. T requests takeoff with autopilot OFF;
+the operator must observe hover before selecting themselves and pressing A.
+
+`--person --distance-view` adds background, display-only distance estimates and
+automatically starts raw/HUD/journal recording on T. It does not use distance to
+steer or establish airborne state. Software regression tests exercise permission
+gates, encoded commands, stale/changed selections and recording errors with fake
+hardware. They do not verify physical hover, landing, or motor-stop delivery.
+
+## Subsequent failed lift and flip
+
+Later physical attempts included unexpected sideways motion, motors spinning
+without lift, and an upside-down flip after autopilot was enabled. The operator
+confirmed the motors stopped afterward. Review of the completed flip-session
+journal found 4,970 sampled control/ACK packets with neutral axis bytes and no
+flip bit; the saved video showed the camera close to the ground at activation,
+then tipping sharply. Unchanged packets are sampled, so this is not a complete
+network capture or proof of the drone's interpretation.
+
+The application sets its local flying flag when submitting takeoff, then allows
+tracking after a three-second hold with fresh video. This can allow A without
+actual lift. That readiness gap is confirmed; the physical cause of the flip
+remains unresolved. A socket error occurred later and does not establish the
+cause of the earlier motion. No throttle increase or speculative flight-control
+repair was made during the review. Private footage and detailed journals stay
+local and are excluded from Git.

@@ -98,7 +98,7 @@ accuracy measurements.
 YOLO11s keeps the close-up selected for every frame after the initial three-frame
 confirmation. It has a regression on the outdoor walk, so **YOLO11n remains the
 default**; YOLO11s is available explicitly via the existing `--model` option.
-The girlfriend-alone interval (67–83 s) still has zero confirmed targets with
+The second-subject-only interval (67–83 s) still has zero confirmed targets with
 YOLO11s. The returning user is confirmed in 162 frames after 84 s; six sampled
 frames spanning that interval were visually checked and match the user. This is
 not a manual identity label for every frame.
@@ -181,8 +181,7 @@ it does not validate automatic approach from above.
 
 User clarified that all five clips use the same drone camera, manually repositioned.
 The reference camera was on a paper towel roll on a table, roughly 4 ft 5 in to
-5 ft high, slightly tilted down by an unknown angle. The user's height is 5 ft
-9 in. The airborne camera pointed almost fully downward. Advertised FOV is 60
+5 ft high, slightly tilted down by an unknown angle. The airborne camera pointed almost fully downward. Advertised FOV is 60
 degrees, with its axis unknown. These details do not supply calibrated intrinsics,
 a ground plane, or per-frame airborne camera height and attitude.
 
@@ -286,7 +285,7 @@ that automatic centering has been demonstrated in flight.
 
 ## iPhone-measured 19 / 10 / 3-foot recording (2026-10-12)
 
-New source: `/Users/saltysalt/Downloads/20261012165212471.MOV`, 911 frames,
+New source: `/path/to/calibration_videos/20261012165212471.MOV`, 911 frames,
 36.56 seconds at 24.92 fps, 1920x1080. User reports iPhone Measure readings of
 19 feet at the opening station, 10 feet around 18 seconds, and 3 feet around
 30 seconds, turning around at each station before a final approach to shut down

@@ -69,7 +69,7 @@ were visually inspected. The model was not trained on these videos.
 To review the overhead recording interactively with the updated tracker:
 
 ```sh
-DRONE_VISION_PREPROCESS=on .venv/bin/python main.py --person --dry-run --video /Users/saltysalt/Downloads/20261011165245073.MOV
+DRONE_VISION_PREPROCESS=on .venv/bin/python main.py --person --dry-run --video /path/to/calibration_videos/20261011165245073.MOV
 ```
 
 Click a clear person box to select. This command replays the recording without
@@ -86,12 +86,12 @@ It uses the same model, preprocessing and video-time replay method above.
 | Source interval | Observed scene | Confirmed output |
 | --- | --- | --- |
 | 35–55 s | Walk to the trash can and back | 448 / 497 frames (90.1%) |
-| 67–83 s | Selected subject absent; girlfriend enters and remains alone | 0 frames |
+| 67–83 s | Selected subject absent; another subject enters and remains alone | 0 frames |
 | 84 s–end | Subject returns; both people visible | 138 / 332 frames |
 
 The first confirmed output after returning is at **84.384 seconds**, on track
 176. Sampled confirmed boxes after the return were visually checked and are on
-the intended subject, not his girlfriend. The zero outputs during 67–83 seconds
+the intended subject, not the second subject. The zero outputs during 67–83 seconds
 cover every replayed frame in that interval. This checks the lost-target output;
 no physical hover or flight response was tested.
 
@@ -159,10 +159,10 @@ the same one-time selection at/after 6 seconds in `20261011182901040.MOV`:
 | Entire clip | 743 | 1,112 | 2,421 |
 
 All confirmed outputs in the return interval use the intended subject's track
-176, with no confirmed outputs on his girlfriend's track 142. Sampled recovered
+176, with no confirmed outputs on the second subject's track 142. Sampled recovered
 boxes in the indoor/doorway section were visually checked against the video.
 A candidate that discarded saturation information was rejected because it
-incorrectly selected the girlfriend during the subject's absence.
+incorrectly selected the second subject during the subject's absence.
 
 Regression replays on the earlier clips, using their original selection times:
 
@@ -221,7 +221,7 @@ produced zero confirmed targets throughout 67–83 seconds (398 frames). From
 84 seconds onward all 155 confirmed outputs used his track 176, first at
 84.142 seconds.
 
-A separate replay using the fresh detections selected the girlfriend at/after
+A separate replay using the fresh detections selected the second subject at/after
 74 seconds. It produced **242 / 249 confirmed frames during 74–84 seconds**,
 and **128 / 332 from 84 seconds to the end**, all on her track 142. It never
 confirmed his track 176 in that scenario. Sampled confirmed boxes were visually
@@ -237,6 +237,6 @@ person, outfit or environment.
 Full-length comparison showing either selection:
 `/tmp/drone-tracking-eval/choose-either-person-full.mp4` (97.375 seconds, all
 2,421 frames, silent). Left selects the original subject at 6 seconds; right
-selects the girlfriend at 74 seconds. Fresh inference reproduced the cached
+selects the second subject at 74 seconds. Fresh inference reproduced the cached
 selection-comparison rows exactly. Summary JSON:
 `/tmp/drone-tracking-eval/all-videos-current-summary.json`.

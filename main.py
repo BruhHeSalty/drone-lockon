@@ -1,7 +1,7 @@
 """Runs the whole thing: video -> vision -> controller -> HUD -> drone.
 
-Live launches are currently blocked after the takeoff-on-close incident.
-The live-mode descriptions below describe the retained, offline-tested logic.
+Live testing is restricted to --flight-test and yaw-only --person.
+Following and unrestricted live control remain blocked.
 
 Live first-flight check: python main.py --flight-test (tracking disabled).
 Manual control + tracking display: python main.py --manual.
@@ -180,7 +180,9 @@ class ManualWindow:
         self.root.destroy()
 
 
-def main(flight_test=False, person=False, person_options=None, follow=False, manual=False):
+def main(flight_test=False, person=False, person_options=None, follow=False, manual=False, distance_view=False):
+    if distance_view and (not person or flight_test or follow or manual):
+        raise ValueError('Distance flight view requires --person only')
     if manual and (flight_test or follow):
         raise ValueError('Choose one control mode')
     person = person or follow or manual
@@ -195,13 +197,21 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
             "Neutral sticks have not been verified to hold this drone. "
             "Use --follow --dry-run for tracking preview; do not repeat the live follow launch."
         )
-    require_safe_live_control()  # Reject unsafe live launches before models, video or control sockets.
+    yaw_only = person and not follow and not manual
+    # Only these explicit modes may open live control; no generic override.
+    require_safe_live_control(flight_test=flight_test, yaw_only=yaw_only)
     if live and (not (flight_test or person) or config.VIDEO_SOURCE != "drone"):
         raise RuntimeError(
             "Live control requires --flight-test, --person or --follow (drone video only). "
             "Use CONTROL_PORT = None for tracking demos."
         )
     video = link = recorder = raw_recorder = tracker = ui = None
+    distance_worker = distance_recorder = None
+    if distance_view:
+        from flight_distance import AsyncDistance, make_view as distance_display, source_click
+        from distance_check import Recording as DistanceRecording
+    session_started = time.monotonic()
+    distance_result = dict(feet=None, reason='Waiting for selection', keypoints=None)
     autopilot = False
     # Seeing a target is not permission to steer. Automatic steering starts OFF.
     follow_pending = False
@@ -221,6 +231,12 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
     def on_click(event, x, y, flags, param):
         nonlocal autopilot, target, follow_pending, follow_wait_reason
         if not flight_test and event == cv2.EVENT_LBUTTONDOWN and last_frame is not None:
+            if distance_view:
+                mapped = source_click(last_frame, x, y)
+                if mapped is None:
+                    return
+                x, y = mapped
+                distance_worker.reset()
             hud.reset_lock()
             if person:
                 autopilot = False
@@ -237,14 +253,43 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
                 follow_pending = True
                 print("[main] Follow requested by click; holding until takeoff hold and person confirmation finish. H cancels.")
 
+    def stop_distance_recording():
+        nonlocal distance_recorder
+        if distance_recorder is not None:
+            try:
+                distance_recorder.close()
+            except Exception as exc:
+                print(f'[main] Distance recording save failed: {exc}')
+            distance_recorder = None
+
+    def start_distance_recording():
+        nonlocal distance_recorder
+        if distance_recorder is not None:
+            return True
+        if not fresh or frame is None:
+            print('[main] Wait for fresh video before recording/takeoff')
+            return False
+        try:
+            distance_recorder = DistanceRecording('distance_recordings', frame, view,
+                                                 distance_worker.profile, time.monotonic()-session_started)
+            distance_recorder.event('flight_test_metadata', live=live, yaw_only=True,
+                                    distance_controls_flight=False, autopilot_starts_off=True)
+            return True
+        except Exception as exc:
+            stop_distance_recording()
+            print(f'[main] Cannot record distance test: {exc}')
+            return False
+
     try:
         # Load the model before opening a flight connection.
         tracker = AsyncPersonTracker(PersonTracker(allow_live_yaw=True, **(person_options or {}))) if person else ColorTracker()
+        if distance_view:
+            distance_worker = AsyncDistance()
         video = VideoSource()
         controller = Controller(person_mode=person, follow_mode=follow)
         if manual:
             ui = ManualWindow(on_click)
-        link = DroneLink(flight_test=manual_controls)
+        link = DroneLink(flight_test=manual_controls, yaw_only=yaw_only)
         if not manual:
             # Let the native window scale the finished camera-size overlay.
             # AUTOSIZE fights resize/fullscreen transitions on some backends.
@@ -265,7 +310,7 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
                 print("[main] FOLLOW: T takeoff/neutral hold, then click person to start following; H neutral, SPACE land")
                 print("[main] Image-size following only: no measured distance or obstacle avoidance. No reverse, strafe or climb.")
             else:
-                print("[main] PERSON: click to select, T takeoff, A yaw tracking, H neutral, SPACE land")
+                print("[main] PERSON: T takeoff, observe steady hover, click to select, A yaw tracking, H neutral, SPACE land")
                 print("[main] Turn only. Selection is remembered out of view; uncertain matches hover until reacquired.")
             if not live:
                 print("[main] DRY RUN: camera/selection preview only; no flight commands")
@@ -347,10 +392,17 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
                                   autopilot=autopilot, follow_pending=follow_pending)
                 last_tracking_status = tracking_status
             # Step 5: draw labels and aiming marks on a copy of the picture.
-            view = hud.draw(display_frame, target, state, command, autopilot, fps)
-            if person:
+            if distance_view:
+                observation = tracker.distance_observation(video_fresh=fresh)
+                distance_result = distance_worker.update(observation)
+                view = distance_display(display_frame, observation, distance_result,
+                                        time.monotonic()-session_started, autopilot, command, live,
+                                        distance_recorder is not None, fresh)
+            else:
+                view = hud.draw(display_frame, target, state, command, autopilot, fps)
+            if person and not distance_view:
                 tracker.draw_candidates(view, video_fresh=fresh)
-                mode_hint = ("PERSON: click select | A turn only | H neutral | SPACE land" if live
+                mode_hint = ("T takeoff | A after steady hover: turn only | H neutral | SPACE land" if live
                              else "DRY RUN: no flight commands | click a person box")
                 if follow:
                     mode_hint = ("FOLLOW: T takeoff | click to follow | H neutral | SPACE land" if live
@@ -385,7 +437,7 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
                     video_gap_since = display_now
                 if last_camera is None or display_now - video_gap_since >= 0.3:
                     video_warning_until = display_now + 0.5
-            if display_now < video_warning_until:
+            if display_now < video_warning_until and not distance_view:
                 video_hint = 'VIDEO DELAYED / WAITING FOR STABLE FRAMES'
                 cv2.putText(view, video_hint, (10, 70),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
@@ -396,6 +448,15 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
                 cv2.putText(view, f"Manual roll {command['right']:+.2f} (short taps)", (10, 130),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+            if distance_recorder is not None and frame is not None:
+                try:
+                    distance_recorder.write(frame, view, session_seconds=time.monotonic()-session_started,
+                                            source_frame_time=video.frame_time, video_fresh=bool(fresh),
+                                            target=target, result=distance_result, command=dict(command),
+                                            autopilot=autopilot, state=state)
+                except Exception as exc:
+                    print(f'[main] Recording stopped after write failure: {exc}')
+                    stop_distance_recording()  # Keep flight keys responsive after a disk error.
             if recorder is not None:
                 if frame is not None:
                     raw_recorder.write(frame)
@@ -505,7 +566,29 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
                 follow_pending = False
                 controller.disarm_follow()
                 link.hover()
+                if distance_view and not start_distance_recording():
+                    continue  # A requested recorded test must have working writers before T.
+                if distance_recorder is not None:
+                    try:
+                        distance_recorder.event('takeoff_key', session_seconds=time.monotonic()-session_started)
+                    except Exception as exc:
+                        print(f'[main] Takeoff not requested: recording failed: {exc}')
+                        stop_distance_recording()
+                        continue
                 link.takeoff()
+            elif distance_view and key == ord('m'):
+                if distance_recorder is not None:
+                    try:
+                        marker = distance_recorder.mark(time.monotonic()-session_started, distance_result)
+                        print(f'[main] Marker {marker}: bookmark only; record the measured stationary interval')
+                    except Exception as exc:
+                        print(f'[main] Cannot save marker: {exc}')
+                        stop_distance_recording()
+            elif distance_view and key == ord('r'):
+                if distance_recorder is None:
+                    start_distance_recording()
+                else:
+                    stop_distance_recording()
             elif key == ord("r") and frame is not None:
                 # Save two movies: one with screen labels and one with clean pictures.
                 if recorder is None:
@@ -544,6 +627,9 @@ def main(flight_test=False, person=False, person_options=None, follow=False, man
                 if video is not None:
                     video.release()
             finally:
+                stop_distance_recording()
+                if distance_worker is not None:
+                    distance_worker.close()
                 if recorder is not None:
                     recorder.release()
                 if raw_recorder is not None:
@@ -569,6 +655,8 @@ if __name__ == "__main__":
     modes.add_argument('--distance-check', action='store_true', help='Grounded camera-only distance readings and R recording; flight controls disabled')
     modes.add_argument("--follow", action="store_true", help="Follow preview only: requires --dry-run while hover failure is investigated")
     parser.add_argument("--dry-run", action="store_true", help="Disable all outgoing flight commands")
+    parser.add_argument('--distance-view', action='store_true',
+                        help='With --person: distance display instead of lock-on HUD; T starts recording')
     parser.add_argument("--webcam", action="store_true", help="Use the laptop camera (requires --dry-run)")
     parser.add_argument("--video", help="Replay a recording (requires --dry-run)")
     parser.add_argument("--model", default="yolo11n.pt", help="Person model name or local weights path")
@@ -576,6 +664,8 @@ if __name__ == "__main__":
     parser.add_argument("--imgsz", type=int, default=640, help="Person inference size, multiple of 32 (320-1280)")
     parser.add_argument("--tracker", choices=("botsort", "bytetrack"), default="botsort")
     args = parser.parse_args()
+    if args.distance_view and not args.person:
+        parser.error('--distance-view requires --person')
     if args.distance_check:
         args.dry_run = True
     if args.webcam and not args.dry_run:
@@ -593,4 +683,5 @@ if __name__ == "__main__":
         from distance_check import run
         run(person_options=options)
     else:
-        main(flight_test=args.flight_test, person=args.person, follow=args.follow, manual=args.manual, person_options=options)
+        main(flight_test=args.flight_test, person=args.person, follow=args.follow, manual=args.manual,
+             distance_view=args.distance_view, person_options=options)
